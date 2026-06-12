@@ -11,7 +11,6 @@ from datetime import datetime, timedelta, timezone
 import re
 from collections import defaultdict
 from io import BytesIO
-import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,45 +35,30 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 # ─────────────────────────────────────────
 #  Persistance (fichiers JSON)
 # ─────────────────────────────────────────
-WARNS_FILE       = "warns.json"
-CONFIG_FILE      = "config.json"
-GIVEAWAY_FILE    = "giveaways.json"
-TEMPBAN_FILE     = "tempbans.json"
-MARRIAGES_FILE   = "marriages.json"
-TEMPROLES_FILE   = "temproles.json"
-TICKETS_FILE     = "tickets.json"
-RREACTIONS_FILE  = "reaction_roles.json"
+WARNS_FILE    = "warns.json"
+CONFIG_FILE   = "config.json"
+GIVEAWAY_FILE = "giveaways.json"
+TEMPBAN_FILE  = "tempbans.json"
 
 def load_json(path):
     if not os.path.exists(path):
         return {}
     with open(path, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return {}
+        return json.load(f)
 
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-warns_db       = load_json(WARNS_FILE)
-config_db      = load_json(CONFIG_FILE)
-giveaway_db    = load_json(GIVEAWAY_FILE)
-tempban_db     = load_json(TEMPBAN_FILE)
-marriages_db   = load_json(MARRIAGES_FILE)
-temproles_db   = load_json(TEMPROLES_FILE)
-tickets_db     = load_json(TICKETS_FILE)
-rreactions_db  = load_json(RREACTIONS_FILE)
+warns_db    = load_json(WARNS_FILE)
+config_db   = load_json(CONFIG_FILE)
+giveaway_db = load_json(GIVEAWAY_FILE)
+tempban_db  = load_json(TEMPBAN_FILE)
 
-def save_warns():       save_json(WARNS_FILE, warns_db)
-def save_config():      save_json(CONFIG_FILE, config_db)
-def save_giveaways():   save_json(GIVEAWAY_FILE, giveaway_db)
-def save_tempbans():    save_json(TEMPBAN_FILE, tempban_db)
-def save_marriages():   save_json(MARRIAGES_FILE, marriages_db)
-def save_temproles():   save_json(TEMPROLES_FILE, temproles_db)
-def save_tickets():     save_json(TICKETS_FILE, tickets_db)
-def save_rreactions():  save_json(RREACTIONS_FILE, rreactions_db)
+def save_warns():     save_json(WARNS_FILE, warns_db)
+def save_config():    save_json(CONFIG_FILE, config_db)
+def save_giveaways(): save_json(GIVEAWAY_FILE, giveaway_db)
+def save_tempbans():  save_json(TEMPBAN_FILE, tempban_db)
 
 def get_guild_cfg(guild_id: int) -> dict:
     key = str(guild_id)
@@ -83,25 +67,24 @@ def get_guild_cfg(guild_id: int) -> dict:
     return config_db[key]
 
 # ─────────────────────────────────────────
-#  Mémoire en RAM
+#  Automod — Mémoire en RAM (spam tracker)
 # ─────────────────────────────────────────
+# { guild_id: { user_id: [timestamps] } }
 _spam_tracker: dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
-_snipe_cache:  dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
-_flood_cache:  dict[tuple, list]          = defaultdict(list)
-_bot_stats = {
-    "commands_used": 0,
-    "automod_actions": 0,
-    "messages_today": 0,
-    "members_joined_week": 0,
-}
-SNIPE_MAX_AGE     = timedelta(days=3)
+
+# ─────────────────────────────────────────
+#  Snipe cache (messages supprimés)
+# ─────────────────────────────────────────
+_snipe_cache: dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+SNIPE_MAX_AGE = timedelta(days=3)
 SNIPE_MAX_PER_USER = 25
-_start_time = datetime.now(timezone.utc)
+
 
 # ─────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────
 def parse_duration(text: str):
+    """Convertit '10m', '2h', '1d' en timedelta. Retourne None si invalide."""
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     m = re.fullmatch(r"(\d+)([smhd])", text.strip().lower())
     if not m:
@@ -109,6 +92,7 @@ def parse_duration(text: str):
     return timedelta(seconds=int(m.group(1)) * units[m.group(2)])
 
 def format_duration(td: timedelta) -> str:
+    """Formate un timedelta en texte lisible."""
     total = int(td.total_seconds())
     if total >= 86400:
         return f"{total // 86400}j {(total % 86400) // 3600}h"
@@ -153,90 +137,60 @@ def check_hierarchy(ctx, member: discord.Member) -> bool:
 #  Automod — Configuration par défaut
 # ─────────────────────────────────────────
 AUTOMOD_DEFAULTS = {
-    "enabled":           False,
-    "anti_links":        False,
-    "anti_invites":      False,
-    "anti_spam":         False,
-    "anti_caps":         False,
-    "anti_mentions":     False,
-    "anti_badwords":     False,
-    "anti_zalgo":        False,
-    "anti_flood":        False,
-    "anti_scam":         False,   # NOUVEAU : détecte les liens de scam connus
-    "spam_threshold":    5,
-    "spam_interval":     5,
-    "caps_percent":      70,
-    "caps_min_length":   10,
-    "max_mentions":      5,
-    "badwords":          [],
-    "flood_count":       3,
-    "action":            "delete",
-    "mute_duration":     "10m",
-    "exempt_roles":      [],
-    "exempt_channels":   [],
-    "log_automod":       True,
-    "warn_threshold":    0,       # NOUVEAU : nb warns avant action auto (0 = désactivé)
-    "warn_action":       "mute",  # NOUVEAU : action déclenchée au seuil
-    "warn_action_dur":   "1h",    # NOUVEAU : durée si l'action est mute/tempban
-    "whitelist_domains": [],      # NOUVEAU : domaines autorisés malgré anti_links
+    "enabled":         False,   # Automod activé globalement
+    "anti_links":      False,   # Bloquer les liens externes
+    "anti_invites":    False,   # Bloquer les invitations Discord
+    "anti_spam":       False,   # Anti-spam (trop de messages rapides)
+    "anti_caps":       False,   # Bloquer les messages en MAJUSCULES
+    "anti_mentions":   False,   # Bloquer les @mention floods
+    "anti_badwords":   False,   # Bloquer les mots interdits
+    "anti_zalgo":      False,   # Bloquer le texte Zalgo (caractères spéciaux)
+    "anti_flood":      False,   # Bloquer les messages identiques répétés
+    "spam_threshold":  5,       # Nb messages en X secondes = spam
+    "spam_interval":   5,       # Fenêtre de temps en secondes
+    "caps_percent":    70,      # % de majuscules pour déclencher le filtre
+    "caps_min_length": 10,      # Longueur minimale pour vérifier les caps
+    "max_mentions":    5,       # Nb max de @mentions par message
+    "badwords":        [],      # Liste de mots interdits
+    "flood_count":     3,       # Nb de fois le même message = flood
+    "action":          "delete",# Action : "delete", "warn", "mute", "kick"
+    "mute_duration":   "10m",   # Durée du mute automatique
+    "exempt_roles":    [],      # Rôles exemptés de l'automod
+    "exempt_channels": [],      # Salons exemptés de l'automod
+    "log_automod":     True,    # Logger les actions de l'automod
 }
-
-# Patterns scam connus
-SCAM_PATTERNS = [
-    re.compile(r"free\s*(nitro|discord\s*nitro)", re.IGNORECASE),
-    re.compile(r"claim\s*your\s*(free|gift)", re.IGNORECASE),
-    re.compile(r"steam\s*gift", re.IGNORECASE),
-]
 
 def get_automod_cfg(guild_id: int) -> dict:
     cfg = get_guild_cfg(guild_id)
     if "automod" not in cfg:
         cfg["automod"] = dict(AUTOMOD_DEFAULTS)
     else:
+        # Compléter les clés manquantes avec les valeurs par défaut
         for k, v in AUTOMOD_DEFAULTS.items():
             if k not in cfg["automod"]:
                 cfg["automod"][k] = v
     return cfg["automod"]
 
 # Patterns de détection
-# Anti-liens : exclut les GIFs tenor/giphy, les liens tenor.com et giphy.com, et les attachments Discord
 URL_PATTERN     = re.compile(r"https?://\S+|www\.\S+|\S+\.\S{2,}/\S*", re.IGNORECASE)
-GIF_WHITELIST   = re.compile(
-    r"https?://(tenor\.com|giphy\.com|media\.tenor\.com|i\.giphy\.com|cdn\.discordapp\.com|media\.discordapp\.net)\S*",
-    re.IGNORECASE
-)
 INVITE_PATTERN  = re.compile(r"discord\.gg/\S+|discord\.com/invite/\S+|discordapp\.com/invite/\S+", re.IGNORECASE)
 ZALGO_PATTERN   = re.compile(r"[\u0300-\u036f\u0489\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]{3,}")
 
-def has_non_gif_link(content: str, whitelist_domains: list) -> bool:
-    """Retourne True si le message contient un lien qui n'est PAS un GIF autorisé."""
-    for match in URL_PATTERN.finditer(content):
-        url = match.group(0)
-        # Exempter les GIFs
-        if GIF_WHITELIST.match(url):
-            continue
-        # Exempter les domaines whitelist configurés
-        if any(domain.lower() in url.lower() for domain in whitelist_domains):
-            continue
-        return True
-    return False
-
 async def automod_action(message: discord.Message, reason: str, am_cfg: dict):
     """Effectue l'action configurée après détection d'une infraction."""
-    global _bot_stats
-    _bot_stats["automod_actions"] += 1
-
     guild  = message.guild
     member = message.author
     action = am_cfg.get("action", "delete")
 
+    # Toujours supprimer le message
     try:
         await message.delete()
     except (discord.Forbidden, discord.NotFound):
         pass
 
+    # Notifier le membre
     try:
-        await message.channel.send(
+        notif = await message.channel.send(
             embed=warning_embed("🤖 AutoMod", f"{member.mention} — {reason}"),
             delete_after=6
         )
@@ -248,8 +202,6 @@ async def automod_action(message: discord.Message, reason: str, am_cfg: dict):
         entry = {"reason": f"[AutoMod] {reason}", "date": datetime.now(timezone.utc).isoformat(), "mod": str(bot.user.id)}
         warns_db.setdefault(gid, {}).setdefault(uid, []).append(entry)
         save_warns()
-        # Vérifier le seuil de warns
-        await check_warn_threshold(guild, member, am_cfg)
 
     elif action == "mute":
         duration = am_cfg.get("mute_duration", "10m")
@@ -266,12 +218,7 @@ async def automod_action(message: discord.Message, reason: str, am_cfg: dict):
         except discord.Forbidden:
             pass
 
-    elif action == "ban":
-        try:
-            await member.ban(reason=f"[AutoMod] {reason}", delete_message_days=1)
-        except discord.Forbidden:
-            pass
-
+    # Log automod
     if am_cfg.get("log_automod", True):
         e = mod_embed(
             "🤖 AutoMod — Infraction",
@@ -284,61 +231,8 @@ async def automod_action(message: discord.Message, reason: str, am_cfg: dict):
         )
         await send_log(guild, e)
 
-async def check_warn_threshold(guild: discord.Guild, member: discord.Member, am_cfg: dict):
-    """Applique une action automatique si le membre dépasse le seuil de warns."""
-    threshold = am_cfg.get("warn_threshold", 0)
-    if threshold <= 0:
-        return
-    gid, uid = str(guild.id), str(member.id)
-    count = len(warns_db.get(gid, {}).get(uid, []))
-    if count < threshold:
-        return
-
-    action   = am_cfg.get("warn_action", "mute")
-    dur_str  = am_cfg.get("warn_action_dur", "1h")
-    delta    = parse_duration(dur_str) or timedelta(hours=1)
-
-    reason = f"Seuil de {threshold} warns atteint ({count} warns)"
-
-    if action == "mute":
-        until = datetime.now(timezone.utc) + delta
-        try:
-            await member.timeout(until, reason=reason)
-        except discord.Forbidden:
-            pass
-    elif action == "kick":
-        try:
-            await member.kick(reason=reason)
-        except discord.Forbidden:
-            pass
-    elif action == "ban":
-        try:
-            await member.ban(reason=reason, delete_message_days=1)
-        except discord.Forbidden:
-            pass
-    elif action == "tempban":
-        until_ts = int((datetime.now(timezone.utc) + delta).timestamp())
-        try:
-            await member.ban(reason=reason, delete_message_days=1)
-            gid_str = str(guild.id)
-            tempban_db.setdefault(gid_str, {})[uid] = {
-                "end_ts": until_ts, "reason": reason, "mod_id": str(bot.user.id)
-            }
-            save_tempbans()
-        except discord.Forbidden:
-            pass
-
-    e = mod_embed(
-        "⚠️ Seuil de warns atteint",
-        f"**Membre :** {member.mention} (`{member.id}`)\n"
-        f"**Warns :** {count}/{threshold}\n"
-        f"**Action automatique :** {action}" +
-        (f" ({dur_str})" if action in ("mute", "tempban") else ""),
-        discord.Color.dark_orange()
-    )
-    await send_log(guild, e)
-
 def is_exempt(message: discord.Message, am_cfg: dict) -> bool:
+    """Retourne True si le message est exempté de l'automod."""
     member = message.author
     if member.guild_permissions.administrator:
         return True
@@ -358,15 +252,13 @@ def is_exempt(message: discord.Message, am_cfg: dict) -> bool:
 async def on_ready():
     print(f"✅ Connecté en tant que {bot.user} (ID: {bot.user.id})")
     print(f"   Préfixe : {PREFIX}")
-    for task in (check_giveaways, resume_tempbans, check_temproles):
-        if not task.is_running():
-            task.start()
+    if not check_giveaways.is_running():
+        check_giveaways.start()
+
+    if not resume_tempbans.is_running():
+        resume_tempbans.start()
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching, name=f"{PREFIX}help · modération"))
-
-@bot.event
-async def on_command(ctx):
-    _bot_stats["commands_used"] += 1
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -385,9 +277,11 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.CheckFailure):
         pass
     elif isinstance(error, commands.CommandNotFound):
-        pass
+        pass  # Ignorer les commandes inconnues silencieusement
     else:
-        log.error(f"Erreur non gérée dans '{ctx.command}': {traceback.format_exc()}")
+        # Log l'erreur sans crasher le bot
+        import traceback as tb
+        log.error(f"Erreur non gérée dans '{ctx.command}': {tb.format_exc()}")
         try:
             await ctx.reply("❌ Une erreur interne est survenue. Réessaie plus tard.")
         except discord.Forbidden:
@@ -395,7 +289,6 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_member_join(member):
-    _bot_stats["members_joined_week"] += 1
     cfg = get_guild_cfg(member.guild.id)
     auto_role_id = cfg.get("auto_role")
     if auto_role_id:
@@ -418,6 +311,7 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_remove(member):
+    """Log quand un membre quitte le serveur."""
     cfg = get_guild_cfg(member.guild.id)
     ch_id = cfg.get("log_channel")
     if not ch_id:
@@ -432,25 +326,35 @@ async def on_member_remove(member):
     except discord.Forbidden:
         pass
 
+
 @bot.event
 async def on_message_delete(message: discord.Message):
+    """Stocke les messages supprimés pour la commande +snipe."""
+
     if not message.guild or message.author.bot:
         return
+
     if not message.content and not message.attachments:
         return
+
     gid = message.guild.id
     uid = message.author.id
+
     data = {
-        "content":     message.content[:1900],
-        "channel_id":  message.channel.id,
-        "created_at":  datetime.now(timezone.utc).isoformat(),
+        "content": message.content[:1900],
+        "channel_id": message.channel.id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "attachments": [a.url for a in message.attachments[:5]]
     }
+
     _snipe_cache[gid][uid].append(data)
     _snipe_cache[gid][uid] = _snipe_cache[gid][uid][-SNIPE_MAX_PER_USER:]
+
     now = datetime.now(timezone.utc)
+
     for user_id in list(_snipe_cache[gid].keys()):
         filtered = []
+
         for entry in _snipe_cache[gid][user_id]:
             try:
                 ts = datetime.fromisoformat(entry["created_at"])
@@ -458,98 +362,26 @@ async def on_message_delete(message: discord.Message):
                     filtered.append(entry)
             except Exception:
                 pass
+
         if filtered:
             _snipe_cache[gid][user_id] = filtered
         else:
             _snipe_cache[gid].pop(user_id, None)
 
-@bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-    """Log les éditions de messages."""
-    if not before.guild or before.author.bot:
-        return
-    if before.content == after.content:
-        return
-    cfg = get_guild_cfg(before.guild.id)
-    ch_id = cfg.get("log_channel")
-    if not ch_id:
-        return
-    ch = before.guild.get_channel(int(ch_id))
-    if not ch:
-        return
-    e = info_embed(
-        "✏️ Message édité",
-        f"**Auteur :** {before.author.mention} (`{before.author.id}`)\n"
-        f"**Salon :** {before.channel.mention}\n"
-        f"**Avant :** {before.content[:500] or '[vide]'}\n"
-        f"**Après :** {after.content[:500] or '[vide]'}"
-    )
-    try:
-        await ch.send(embed=e)
-    except discord.Forbidden:
-        pass
-
-@bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    """Gestion des reaction roles."""
-    if payload.member and payload.member.bot:
-        return
-    gid = str(payload.guild_id)
-    mid = str(payload.message_id)
-    emoji_str = str(payload.emoji)
-    rr_data = rreactions_db.get(gid, {}).get(mid, {}).get(emoji_str)
-    if not rr_data:
-        return
-    guild = bot.get_guild(payload.guild_id)
-    if not guild:
-        return
-    member = payload.member or guild.get_member(payload.user_id)
-    if not member:
-        return
-    role = guild.get_role(int(rr_data["role_id"]))
-    if not role:
-        return
-    try:
-        await member.add_roles(role, reason="Reaction Role")
-    except discord.Forbidden:
-        pass
-
-@bot.event
-async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    """Retire le rôle si la réaction est enlevée."""
-    gid = str(payload.guild_id)
-    mid = str(payload.message_id)
-    emoji_str = str(payload.emoji)
-    rr_data = rreactions_db.get(gid, {}).get(mid, {}).get(emoji_str)
-    if not rr_data:
-        return
-    guild = bot.get_guild(payload.guild_id)
-    if not guild:
-        return
-    member = guild.get_member(payload.user_id)
-    if not member:
-        return
-    role = guild.get_role(int(rr_data["role_id"]))
-    if not role:
-        return
-    try:
-        await member.remove_roles(role, reason="Reaction Role retiré")
-    except discord.Forbidden:
-        pass
 
 # ─────────────────────────────────────────
 #  Automod — on_message
 # ─────────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
-    _bot_stats["messages_today"] += 1
-
+    # Ignorer les bots et les DM
     if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
 
     am_cfg = get_automod_cfg(message.guild.id)
 
+    # Automod désactivé globalement → on passe directement aux commandes
     if not am_cfg.get("enabled", False) or is_exempt(message, am_cfg):
         await bot.process_commands(message)
         return
@@ -561,19 +393,10 @@ async def on_message(message: discord.Message):
         await automod_action(message, "Invitation Discord non autorisée.", am_cfg)
         return
 
-    # ── Anti-liens externes (GIFs et domaines whitelist exemptés) ─────────
-    if am_cfg.get("anti_links"):
-        whitelist = am_cfg.get("whitelist_domains", [])
-        if has_non_gif_link(content, whitelist):
-            await automod_action(message, "Lien externe non autorisé.", am_cfg)
-            return
-
-    # ── Anti-scam ──────────────────────────────────────────────────────────
-    if am_cfg.get("anti_scam"):
-        for pattern in SCAM_PATTERNS:
-            if pattern.search(content):
-                await automod_action(message, "Message de type scam/phishing détecté.", am_cfg)
-                return
+    # ── Anti-liens externes ───────────────────────────────────────────────
+    if am_cfg.get("anti_links") and URL_PATTERN.search(content):
+        await automod_action(message, "Lien externe non autorisé.", am_cfg)
+        return
 
     # ── Anti-mots interdits ───────────────────────────────────────────────
     if am_cfg.get("anti_badwords"):
@@ -581,7 +404,7 @@ async def on_message(message: discord.Message):
         low = content.lower()
         for word in bad:
             if word.lower() in low:
-                await automod_action(message, "Mot interdit détecté.", am_cfg)
+                await automod_action(message, f"Mot interdit détecté.", am_cfg)
                 return
 
     # ── Anti-majuscules ───────────────────────────────────────────────────
@@ -611,12 +434,17 @@ async def on_message(message: discord.Message):
     # ── Anti-flood (messages identiques) ─────────────────────────────────
     if am_cfg.get("anti_flood") and content.strip():
         flood_count = am_cfg.get("flood_count", 3)
-        key = (message.guild.id, message.channel.id, message.author.id)
-        _flood_cache[key].append(content.strip().lower())
-        _flood_cache[key] = _flood_cache[key][-flood_count:]
-        if (len(_flood_cache[key]) >= flood_count and
-                len(set(_flood_cache[key])) == 1):
-            _flood_cache[key].clear()
+        gid = message.guild.id
+        uid = message.author.id
+        # On stocke les derniers messages de l'utilisateur dans ce salon
+        key = (gid, message.channel.id, uid)
+        if not hasattr(bot, "_flood_cache"):
+            bot._flood_cache = defaultdict(list)
+        bot._flood_cache[key].append(content.strip().lower())
+        bot._flood_cache[key] = bot._flood_cache[key][-flood_count:]
+        if (len(bot._flood_cache[key]) >= flood_count and
+                len(set(bot._flood_cache[key])) == 1):
+            bot._flood_cache[key].clear()
             await automod_action(message, "Flood de messages identiques détecté.", am_cfg)
             return
 
@@ -628,6 +456,7 @@ async def on_message(message: discord.Message):
         gid, uid  = message.guild.id, message.author.id
         timestamps = _spam_tracker[gid][uid]
         timestamps.append(now)
+        # Nettoyer les vieilles entrées
         _spam_tracker[gid][uid] = [t for t in timestamps if now - t <= interval]
         if len(_spam_tracker[gid][uid]) >= threshold:
             _spam_tracker[gid][uid].clear()
@@ -652,103 +481,89 @@ async def help_cmd(ctx, commande: str = None):
         return
 
     e = discord.Embed(
-        title="🤖 Bot — Aide complète",
+        title="🤖 Bot Complet — Aide",
         description=f"Préfixe : `{PREFIX}`  •  `{PREFIX}help <commande>` pour les détails",
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc)
     )
     sections = {
         "🔨 Sanctions": [
-            ("ban",        "<membre> [raison]",              "Bannir définitivement"),
-            ("unban",      "<user_id> [raison]",             "Débannir par ID"),
-            ("kick",       "<membre> [raison]",              "Expulser"),
-            ("mute",       "<membre> <durée> [raison]",      "Mute (10m, 2h, 1d)"),
-            ("unmute",     "<membre> [raison]",              "Retirer le mute"),
-            ("warn",       "<membre> <raison>",              "Avertir"),
-            ("unwarn",     "<membre> <id>",                  "Supprimer un warn"),
-            ("clearwarns", "<membre>",                       "Effacer tous les warns"),
-            ("warns",      "[membre]",                       "Voir les warns"),
-            ("softban",    "<membre> [raison]",              "Ban+déban immédiat"),
-            ("tempban",    "<membre> <durée> <raison>",      "Ban temporaire"),
+            ("ban",      "<membre> [raison]",           "Bannir définitivement"),
+            ("unban",    "<user_id> [raison]",           "Débannir un utilisateur"),
+            ("kick",     "<membre> [raison]",            "Expulser un membre"),
+            ("mute",     "<membre> <durée> [raison]",    "Mute (ex : 10m, 2h, 1d)"),
+            ("unmute",   "<membre> [raison]",            "Retirer le mute"),
+            ("warn",     "<membre> <raison>",            "Avertir un membre"),
+            ("unwarn",   "<membre> <id_warn>",           "Supprimer un avertissement"),
+            ("clearwarns","<membre>",                    "Effacer tous les warns d'un membre"),
+            ("warns",    "[membre]",                     "Voir les avertissements"),
+            ("softban",  "<membre> [raison]",            "Ban + déban immédiat"),
+            ("tempban",  "<membre> <durée> <raison>",    "Ban temporaire"),
         ],
         "🧹 Nettoyage": [
-            ("clear",  "<nombre|all>",       "Supprimer N messages ou tous"),
-            ("purge",  "<membre> [nombre]",  "Supprimer les messages d'un membre"),
-            ("snipe",  "@membre",            "Messages supprimés récents"),
+            ("clear",     "<nombre|all> [membre]",       "Supprimer exactement N messages ou tous (+clear all)"),
+            ("purge",     "<membre> <nombre>",           "Supprimer les messages d'un membre"),
+            ("snipe",     "@membre",                    "Afficher les messages supprimés récents"),
         ],
-        "🔒 Salons": [
-            ("lock",        "[salon]",                   "Verrouiller"),
-            ("unlock",      "[salon]",                   "Déverrouiller"),
-            ("slowmode",    "<sec> [salon]",             "Slowmode"),
+        "🔒 Gestion des salons": [
+            ("lock",        "[salon]",                   "Verrouiller un salon"),
+            ("unlock",      "[salon]",                   "Déverrouiller un salon"),
+            ("slowmode",    "<secondes> [salon]",        "Définir le slowmode"),
             ("nuke",        "[salon]",                   "Recréer un salon"),
-            ("createtext",  "<nom> [catégorie]",         "Créer salon textuel"),
-            ("createvoice", "<nom> [catégorie]",         "Créer salon vocal"),
+            ("createtext",  "<nom> [catégorie]",         "Créer un salon textuel"),
+            ("createvoice", "<nom> [catégorie]",         "Créer un salon vocal"),
             ("createcat",   "<nom>",                     "Créer une catégorie"),
             ("deletechan",  "<salon>",                   "Supprimer un salon"),
-            ("renamechan",  "<salon> <nom>",             "Renommer un salon"),
+            ("renamechan",  "<salon> <nouveau_nom>",     "Renommer un salon"),
         ],
         "🎉 Giveaways": [
-            ("gcreate", "<durée> <gagnants> <prix>", "Lancer un giveaway"),
-            ("gend",    "<message_id>",              "Terminer immédiatement"),
-            ("greroll", "<message_id>",              "Retirer un gagnant"),
-            ("glist",   "",                          "Lister les actifs"),
-        ],
-        "🎫 Tickets": [
-            ("ticket",        "",                        "Ouvrir un ticket de support"),
-            ("closeticket",   "",                        "Fermer le ticket (dans le salon)"),
-            ("setticket",     "<catégorie>",             "Configurer la catégorie tickets"),
-            ("setstaffrole",  "<rôle>",                  "Rôle staff pour les tickets"),
-        ],
-        "🎭 Fun & Social": [
-            ("marry",    "@membre",           "Demander en mariage"),
-            ("divorce",  "",                  "Divorcer"),
-            ("couples",  "",                  "Voir les couples du serveur"),
-            ("coinflip", "",                  "Pile ou Face"),
-            ("roll",     "[NdN]",             "Lancer des dés"),
-            ("8ball",    "<question>",         "Boule magique"),
+            ("gcreate", "<durée> <gagnants> <prix>",     "Lancer un giveaway"),
+            ("gend",    "<message_id>",                  "Terminer un giveaway immédiatement"),
+            ("greroll", "<message_id>",                  "Tirer un nouveau gagnant"),
+            ("glist",   "",                              "Lister les giveaways actifs"),
         ],
         "📢 Utilitaires": [
-            ("stats",      "",                            "Statistiques du serveur"),
-            ("botinfo",    "",                            "Infos sur le bot"),
-            ("poll",       "<question> | <opt1> | ...",  "Sondage"),
-            ("remind",     "<durée> <message>",          "Rappel"),
-            ("embed",      "<titre> | <description>",    "Embed personnalisé"),
-            ("announce",   "<message>",                  "Annonce"),
-            ("ping",       "",                           "Latence"),
-            ("uptime",     "",                           "Temps d'activité"),
-            ("calc",       "<expression>",               "Calculatrice"),
+            ("poll",       "<question> | <opt1> | ...",  "Créer un sondage"),
+            ("remind",     "<durée> <message>",          "Se rappeler quelque chose"),
+            ("embed",      "<titre> | <description>",    "Envoyer un embed personnalisé"),
+            ("announce",   "<message>",                  "Faire une annonce en embed"),
+            ("ping",       "",                           "Latence du bot"),
+            ("uptime",     "",                           "Temps d'activité du bot"),
+            ("calc",       "<expression>",               "Calculatrice simple"),
+            ("coinflip",   "",                           "Pile ou face"),
+            ("roll",       "[NdN]",                      "Lancer des dés (ex: 2d6)"),
             ("say",        "<message>",                  "Faire parler le bot"),
-            ("create",     "<emoji>",                    "Voler un emoji"),
+            ("create",     "<emoji>",                    "Voler un emoji d'un autre serveur"),
         ],
         "👤 Membres & Rôles": [
-            ("autorole",       "<rôle>",                       "Auto-rôle à l'arrivée"),
-            ("setwelcome",     "<salon> <message>",            "Message de bienvenue"),
-            ("addrole",        "<membre> <rôle>",              "Donner un rôle"),
-            ("removerole",     "<membre> <rôle>",              "Retirer un rôle"),
-            ("temprole",       "<membre> <rôle> <durée>",      "Rôle temporaire"),
-            ("reactionrole",   "<msg_id> <emoji> <rôle>",      "Reaction role"),
-            ("removereactionrole", "<msg_id> <emoji>",         "Supprimer un reaction role"),
-            ("avatar",         "[membre]",                     "Avatar"),
-            ("userinfo",       "[membre]",                     "Infos membre"),
-            ("serverinfo",     "",                             "Infos serveur"),
-            ("roleinfo",       "<rôle>",                       "Infos rôle"),
+            ("autorole",   "<rôle>",                     "Définir l'auto-rôle à l'arrivée"),
+            ("setwelcome", "<salon> <message>",          "Configurer le message de bienvenue"),
+            ("addrole",    "<membre> <rôle>",            "Donner un rôle à un membre"),
+            ("removerole", "<membre> <rôle>",            "Retirer un rôle d'un membre"),
+            ("avatar",     "[membre]",                   "Afficher l'avatar d'un membre"),
+            ("userinfo",   "[membre]",                   "Infos sur un membre"),
+            ("serverinfo", "",                           "Infos sur le serveur"),
+            ("roleinfo",   "<rôle>",                     "Infos sur un rôle"),
+            ("whois",      "<membre>",                   "Alias de userinfo"),
         ],
         "⚙️ Config": [
-            ("setlog",     "<salon>",  "Salon de logs"),
-            ("setmuterole","<rôle>",   "Rôle muet (legacy)"),
+            ("setlog",     "<salon>",                    "Définir le salon de logs"),
+            ("setmuterole","<rôle>",                     "Définir le rôle muet"),
         ],
         "🛡️ AutoMod": [
-            ("automod", "status",                          "Voir la configuration"),
-            ("automod", "enable / disable",               "Activer / désactiver"),
-            ("automod", "set <règle> on/off",             "Activer/désactiver une règle"),
-            ("automod", "action <delete|warn|mute|kick|ban>", "Action automatique"),
-            ("automod", "mute_duration <durée>",          "Durée du mute auto"),
-            ("automod", "warn_threshold <nb>",            "Seuil warns → action"),
-            ("automod", "warn_action <action>",           "Action au seuil de warns"),
-            ("automod", "whitelist_domain add/remove <domaine>", "Domaine autorisé malgré anti_links"),
-            ("automod", "badword add/remove/list <mot>",  "Mots interdits"),
-            ("automod", "exempt_role @rôle add/remove",   "Exempter un rôle"),
-            ("automod", "exempt_channel #salon add/remove","Exempter un salon"),
+            ("automod",        "status",                 "Voir la configuration de l'automod"),
+            ("automod",        "enable / disable",       "Activer / désactiver l'automod"),
+            ("automod",        "set <règle> on/off",     "Activer/désactiver une règle"),
+            ("automod",        "action <delete|warn|mute|kick>", "Choisir l'action automatique"),
+            ("automod",        "mute_duration <durée>",  "Durée du mute auto"),
+            ("automod",        "spam_threshold <nb>",    "Nb messages = spam"),
+            ("automod",        "spam_interval <sec>",    "Fenêtre anti-spam en secondes"),
+            ("automod",        "caps_percent <nb>",      "Seuil % majuscules"),
+            ("automod",        "max_mentions <nb>",      "Nb max de @mentions"),
+            ("automod",        "flood_count <nb>",       "Nb messages identiques = flood"),
+            ("automod",        "badword add/remove <mot>","Gérer les mots interdits"),
+            ("automod",        "exempt_role @rôle add/remove","Exempter un rôle"),
+            ("automod",        "exempt_channel #salon add/remove","Exempter un salon"),
         ],
     }
     for section, cmds in sections.items():
@@ -857,9 +672,6 @@ async def warn(ctx, member: discord.Member, *, reason: str):
         await member.send(embed=warning_embed("⚠️ Tu as reçu un avertissement", f"**Serveur :** {ctx.guild.name}\n**Raison :** {reason}\n**Total :** {count} warn(s)"))
     except Exception:
         pass
-    # Vérifier le seuil de warns
-    am_cfg = get_automod_cfg(ctx.guild.id)
-    await check_warn_threshold(ctx.guild, member, am_cfg)
 
 @bot.command()
 @commands.has_permissions(kick_members=True)
@@ -877,15 +689,16 @@ async def unwarn(ctx, member: discord.Member, warn_id: int):
 @bot.command()
 @commands.has_permissions(kick_members=True)
 async def clearwarns(ctx, member: discord.Member):
-    """Effacer tous les avertissements d'un membre."""
+    """Effacer tous les avertissements d'un membre. Usage : +clearwarns @membre"""
     gid, uid = str(ctx.guild.id), str(member.id)
     count = len(warns_db.get(gid, {}).get(uid, []))
     if count == 0:
-        return await ctx.reply(f"✅ {member.mention} n'a aucun avertissement.")
+        return await ctx.reply(f"✅ {member.mention} n'a aucun avertissement à effacer.")
     warns_db.setdefault(gid, {})[uid] = []
     save_warns()
     e = success_embed("🧹 Warns effacés", f"**{count}** avertissement(s) supprimé(s) pour {member.mention}\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
+    await send_log(ctx.guild, e)
 
 @bot.command()
 async def warns(ctx, member: discord.Member = None):
@@ -933,11 +746,15 @@ async def tempban(ctx, member: discord.Member, duration: str, *, reason: str = "
     except Exception:
         pass
     await member.ban(reason=f"[TEMPBAN {duration}] {ctx.author} : {reason}", delete_message_days=1)
+
     gid = str(ctx.guild.id)
     tempban_db.setdefault(gid, {})[str(member.id)] = {
-        "end_ts": until_ts, "reason": reason, "mod_id": str(ctx.author.id),
+        "end_ts": until_ts,
+        "reason": reason,
+        "mod_id": str(ctx.author.id),
     }
     save_tempbans()
+
     e = mod_embed(
         "⏳ Ban temporaire",
         f"**Cible :** {member.mention} (`{member.id}`)\n**Durée :** {duration}\n**Fin :** <t:{until_ts}:R>\n**Modérateur :** {ctx.author.mention}\n**Raison :** {reason}"
@@ -956,10 +773,12 @@ async def tempban(ctx, member: discord.Member, duration: str, *, reason: str = "
             await send_log(ctx.guild, ue)
         except Exception:
             pass
+
     asyncio.ensure_future(unban_later())
 
 @tasks.loop(count=1)
 async def resume_tempbans():
+    """Replanifie les tempbans persistés au redémarrage."""
     await bot.wait_until_ready()
     now = datetime.now(timezone.utc).timestamp()
     for gid, bans in list(tempban_db.items()):
@@ -998,21 +817,32 @@ async def resume_tempbans():
 @commands.has_permissions(manage_messages=True)
 @commands.bot_has_permissions(manage_messages=True)
 async def clear(ctx, amount: str):
-    """Supprimer les N derniers messages du salon. Usage : +clear <nombre|all>"""
+    """Supprimer les N derniers messages du salon. Usage : +clear <nombre|all>
+
+    Exemples :
+      +clear 5   → supprime les 5 derniers messages (peu importe qui les a envoyés)
+      +clear all → supprime tout (max 14 jours)
+    """
     await ctx.message.delete()
+
     is_all = amount.lower() == "all"
     if not is_all:
         try:
             amount_int = int(amount)
         except ValueError:
-            return await ctx.send("❌ Utilise un nombre ou `all`.", delete_after=5)
+            return await ctx.send("❌ Utilise un nombre ou `all`. Exemple : `+clear 5` ou `+clear all`.", delete_after=5)
         if amount_int < 1 or amount_int > 500:
             return await ctx.send("❌ Nombre entre 1 et 500.", delete_after=5)
+
     after_limit = datetime.now(timezone.utc) - timedelta(days=14)
+
     if is_all:
         deleted = await ctx.channel.purge(limit=None, after=after_limit)
     else:
+        # Pas de filtre "after" pour le clear simple : Discord bulk-delete uniquement les msgs < 14j,
+        # mais on laisse purge() gérer ça en interne sans couper la recherche prématurément.
         deleted = await ctx.channel.purge(limit=amount_int)
+
     e = success_embed("🧹 Nettoyage", f"**{len(deleted)}** message(s) supprimé(s).\n**Modérateur :** {ctx.author.mention}")
     msg = await ctx.send(embed=e)
     await asyncio.sleep(5)
@@ -1023,7 +853,7 @@ async def clear(ctx, amount: str):
 @commands.has_permissions(manage_messages=True)
 @commands.bot_has_permissions(manage_messages=True)
 async def purge(ctx, member: discord.Member, amount: int = 100):
-    """Supprimer les messages d'un membre spécifique. Usage : +purge @membre [nombre]"""
+    """Supprimer les messages d'un membre spécifique (max 500). Usage : +purge @membre [nombre]"""
     if amount < 1 or amount > 500:
         return await ctx.reply("❌ Nombre entre 1 et 500.")
     await ctx.message.delete()
@@ -1044,12 +874,12 @@ async def purge(ctx, member: discord.Member, amount: int = 100):
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def lock(ctx, channel: discord.TextChannel = None):
-    """Verrouiller un salon."""
+    """Verrouiller un salon (empêche @everyone d'envoyer des messages)."""
     channel = channel or ctx.channel
     overwrite = channel.overwrites_for(ctx.guild.default_role)
     overwrite.send_messages = False
-    await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
-    e = mod_embed("🔒 Salon verrouillé", f"{channel.mention} a été verrouillé.\n**Modérateur :** {ctx.author.mention}", discord.Color.orange())
+    await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Lock par {ctx.author}")
+    e = mod_embed("🔒 Salon verrouillé", f"{channel.mention} a été verrouillé.\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
@@ -1061,8 +891,8 @@ async def unlock(ctx, channel: discord.TextChannel = None):
     channel = channel or ctx.channel
     overwrite = channel.overwrites_for(ctx.guild.default_role)
     overwrite.send_messages = None
-    await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
-    e = success_embed("🔓 Salon déverrouillé", f"{channel.mention} est maintenant ouvert.\n**Modérateur :** {ctx.author.mention}")
+    await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Unlock par {ctx.author}")
+    e = success_embed("🔓 Salon déverrouillé", f"{channel.mention} est de nouveau ouvert.\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
@@ -1070,24 +900,25 @@ async def unlock(ctx, channel: discord.TextChannel = None):
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def slowmode(ctx, seconds: int, channel: discord.TextChannel = None):
-    """Définir le slowmode. Usage : +slowmode <secondes> [#salon]"""
+    """Définir le slowmode d'un salon (0 = désactiver, max 21600s)."""
     channel = channel or ctx.channel
     if seconds < 0 or seconds > 21600:
-        return await ctx.reply("❌ Entre 0 et 21600 secondes.")
-    await channel.edit(slowmode_delay=seconds)
-    if seconds == 0:
-        e = success_embed("⏱️ Slowmode désactivé", f"{channel.mention} — Slowmode retiré.")
-    else:
-        e = info_embed("⏱️ Slowmode activé", f"{channel.mention} — **{seconds}s** entre chaque message.")
+        return await ctx.reply("❌ Valeur entre 0 et 21600 secondes.")
+    await channel.edit(slowmode_delay=seconds, reason=f"Slowmode par {ctx.author}")
+    label = f"{seconds}s" if seconds > 0 else "désactivé"
+    e = info_embed("🐢 Slowmode", f"{channel.mention} — slowmode **{label}**.\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
 
 @bot.command()
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def nuke(ctx, channel: discord.TextChannel = None):
-    """Recréer un salon vierge."""
+    """Recréer un salon identique (purge totale). Confirmation requise."""
     channel = channel or ctx.channel
-    confirm_msg = await ctx.send(embed=warning_embed("💥 Confirmation Nuke", f"Recréer **{channel.name}** ? Tape `CONFIRMER` dans les 15 secondes."))
+    confirm_msg = await ctx.send(
+        f"⚠️ **ATTENTION** : Tu vas supprimer et recréer {channel.mention}.\n"
+        f"Tape `CONFIRMER` dans les 15 secondes pour continuer."
+    )
     def check(m): return m.author == ctx.author and m.channel == ctx.channel and m.content == "CONFIRMER"
     try:
         await bot.wait_for("message", check=check, timeout=15)
@@ -1106,7 +937,7 @@ async def nuke(ctx, channel: discord.TextChannel = None):
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def createtext(ctx, nom: str, *, categorie: str = None):
-    """Créer un salon textuel."""
+    """Créer un salon textuel. Usage : +createtext nom [catégorie]"""
     category = None
     if categorie:
         category = discord.utils.get(ctx.guild.categories, name=categorie)
@@ -1121,7 +952,7 @@ async def createtext(ctx, nom: str, *, categorie: str = None):
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def createvoice(ctx, nom: str, *, categorie: str = None):
-    """Créer un salon vocal."""
+    """Créer un salon vocal. Usage : +createvoice nom [catégorie]"""
     category = None
     if categorie:
         category = discord.utils.get(ctx.guild.categories, name=categorie)
@@ -1136,7 +967,7 @@ async def createvoice(ctx, nom: str, *, categorie: str = None):
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def createcat(ctx, *, nom: str):
-    """Créer une catégorie."""
+    """Créer une catégorie. Usage : +createcat Nom de la catégorie"""
     category = await ctx.guild.create_category(nom, reason=f"Créé par {ctx.author}")
     e = success_embed("✅ Catégorie créée", f"**Nom :** {category.name}\n**Créé par :** {ctx.author.mention}")
     await ctx.send(embed=e)
@@ -1146,7 +977,7 @@ async def createcat(ctx, *, nom: str):
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def deletechan(ctx, channel: discord.abc.GuildChannel):
-    """Supprimer un salon."""
+    """Supprimer un salon (textuel ou vocal). Usage : +deletechan #salon"""
     nom = channel.name
     await channel.delete(reason=f"Supprimé par {ctx.author}")
     e = mod_embed("🗑️ Salon supprimé", f"**Nom :** `{nom}`\n**Modérateur :** {ctx.author.mention}")
@@ -1157,7 +988,7 @@ async def deletechan(ctx, channel: discord.abc.GuildChannel):
 @commands.has_permissions(manage_channels=True)
 @commands.bot_has_permissions(manage_channels=True)
 async def renamechan(ctx, channel: discord.abc.GuildChannel, *, nouveau_nom: str):
-    """Renommer un salon."""
+    """Renommer un salon. Usage : +renamechan #salon nouveau-nom"""
     ancien = channel.name
     await channel.edit(name=nouveau_nom, reason=f"Renommé par {ctx.author}")
     e = info_embed("✏️ Salon renommé", f"**Ancien :** `{ancien}`\n**Nouveau :** `{nouveau_nom}`\n**Modérateur :** {ctx.author.mention}")
@@ -1169,17 +1000,21 @@ async def renamechan(ctx, channel: discord.abc.GuildChannel, *, nouveau_nom: str
 # ─────────────────────────────────────────
 GIVEAWAY_EMOJI = "🎉"
 
-def giveaway_embed(prize, winners, end_ts, host, ended=False, winner_mentions=None):
+def giveaway_embed(prize: str, winners: int, end_ts: int, host: discord.Member, ended=False, winner_mentions=None):
     color  = discord.Color.green() if not ended else discord.Color.greyple()
     status = "🎉 **GIVEAWAY**" if not ended else "🏁 **GIVEAWAY TERMINÉ**"
     desc   = f"**Prix :** {prize}\n**Gagnants :** {winners}\n**Organisé par :** {host.mention}\n"
     if not ended:
         desc += f"**Se termine :** <t:{end_ts}:R>\n\nRéagis avec {GIVEAWAY_EMOJI} pour participer !"
     else:
-        desc += f"**Gagnant(s) :** {', '.join(winner_mentions)}" if winner_mentions else "**Aucun participant valide.**"
-    return discord.Embed(title=status, description=desc, color=color, timestamp=datetime.now(timezone.utc))
+        if winner_mentions:
+            desc += f"**Gagnant(s) :** {', '.join(winner_mentions)}"
+        else:
+            desc += "**Aucun participant valide.**"
+    e = discord.Embed(title=status, description=desc, color=color, timestamp=datetime.now(timezone.utc))
+    return e
 
-async def end_giveaway(guild, channel_id, message_id):
+async def end_giveaway(guild: discord.Guild, channel_id: int, message_id: int):
     gid = str(guild.id)
     mid = str(message_id)
     gdata = giveaway_db.get(gid, {}).get(mid)
@@ -1202,14 +1037,16 @@ async def end_giveaway(guild, channel_id, message_id):
     winners = random.sample(participants, nb_winners) if participants else []
     winner_mentions = [w.mention for w in winners]
     host = guild.get_member(gdata["host_id"]) or await bot.fetch_user(gdata["host_id"])
-    await message.edit(embed=giveaway_embed(gdata["prize"], gdata["winners"], gdata["end_ts"], host, ended=True, winner_mentions=winner_mentions))
+    end_ts = gdata["end_ts"]
+    await message.edit(embed=giveaway_embed(gdata["prize"], gdata["winners"], end_ts, host, ended=True, winner_mentions=winner_mentions))
     if winners:
         await channel.send(f"🎉 Félicitations {', '.join(winner_mentions)} ! Vous avez gagné **{gdata['prize']}** !")
     else:
         await channel.send("😢 Personne n'a participé au giveaway.")
-    giveaway_db[gid][mid]["ended"]     = True
+    giveaway_db[gid][mid]["ended"] = True
     giveaway_db[gid][mid]["winner_ids"] = [w.id for w in winners]
     save_giveaways()
+    return winners
 
 @tasks.loop(seconds=15)
 async def check_giveaways():
@@ -1228,25 +1065,31 @@ async def gcreate(ctx, duration: str, winners: int, *, prize: str):
     """Lancer un giveaway. Usage : +gcreate <durée> <gagnants> <prix>"""
     delta = parse_duration(duration)
     if not delta:
-        return await ctx.reply("❌ Durée invalide.")
-    if not 1 <= winners <= 20:
+        return await ctx.reply("❌ Durée invalide. Exemples : `10m`, `2h`, `1d`.")
+    if winners < 1 or winners > 20:
         return await ctx.reply("❌ Entre 1 et 20 gagnants.")
     end_ts = int((datetime.now(timezone.utc) + delta).timestamp())
-    msg = await ctx.send(embed=giveaway_embed(prize, winners, end_ts, ctx.author))
+    e = giveaway_embed(prize, winners, end_ts, ctx.author)
+    msg = await ctx.send(embed=e)
     await msg.add_reaction(GIVEAWAY_EMOJI)
     gid = str(ctx.guild.id)
     giveaway_db.setdefault(gid, {})[str(msg.id)] = {
-        "channel_id": ctx.channel.id, "end_ts": end_ts, "winners": winners,
-        "prize": prize, "host_id": ctx.author.id, "ended": False,
+        "channel_id": ctx.channel.id,
+        "end_ts": end_ts,
+        "winners": winners,
+        "prize": prize,
+        "host_id": ctx.author.id,
+        "ended": False,
     }
     save_giveaways()
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def gend(ctx, message_id: int):
-    """Terminer un giveaway immédiatement."""
+    """Terminer un giveaway immédiatement. Usage : +gend <message_id>"""
     gid = str(ctx.guild.id)
-    gdata = giveaway_db.get(gid, {}).get(str(message_id))
+    mid = str(message_id)
+    gdata = giveaway_db.get(gid, {}).get(mid)
     if not gdata:
         return await ctx.reply("❌ Giveaway introuvable.")
     if gdata.get("ended"):
@@ -1257,11 +1100,14 @@ async def gend(ctx, message_id: int):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def greroll(ctx, message_id: int):
-    """Tirer un nouveau gagnant."""
+    """Tirer un nouveau gagnant pour un giveaway terminé. Usage : +greroll <message_id>"""
     gid = str(ctx.guild.id)
-    gdata = giveaway_db.get(gid, {}).get(str(message_id))
-    if not gdata or not gdata.get("ended"):
-        return await ctx.reply("❌ Giveaway introuvable ou pas encore terminé.")
+    mid = str(message_id)
+    gdata = giveaway_db.get(gid, {}).get(mid)
+    if not gdata:
+        return await ctx.reply("❌ Giveaway introuvable.")
+    if not gdata.get("ended"):
+        return await ctx.reply("❌ Ce giveaway n'est pas encore terminé.")
     channel = ctx.guild.get_channel(gdata["channel_id"])
     if not channel:
         return await ctx.reply("❌ Salon introuvable.")
@@ -1276,480 +1122,33 @@ async def greroll(ctx, message_id: int):
             if not user.bot:
                 participants.append(user)
     if not participants:
-        return await ctx.reply("😢 Aucun participant valide.")
+        return await ctx.reply("😢 Aucun participant valide pour le reroll.")
     winner = random.choice(participants)
-    await ctx.send(f"🎉 Nouveau gagnant : {winner.mention} ! Félicitations pour **{gdata['prize']}** !")
+    await ctx.send(f"🎉 Nouveau gagnant du giveaway : {winner.mention} ! Félicitations pour **{gdata['prize']}** !")
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def glist(ctx):
-    """Lister les giveaways actifs."""
+    """Lister les giveaways actifs sur ce serveur."""
     gid = str(ctx.guild.id)
     actifs = {mid: g for mid, g in giveaway_db.get(gid, {}).items() if not g.get("ended")}
     if not actifs:
         return await ctx.reply("ℹ️ Aucun giveaway actif.")
     e = success_embed("🎉 Giveaways actifs", "")
     for mid, g in actifs.items():
-        ch = ctx.guild.get_channel(g["channel_id"])
-        e.add_field(name=f"🎁 {g['prize']}", value=f"ID : `{mid}`\nSalon : {ch.mention if ch else '?'}\nFin : <t:{g['end_ts']}:R>\nGagnants : {g['winners']}", inline=False)
-    await ctx.send(embed=e)
-
-# ─────────────────────────────────────────
-#  REACTION ROLES
-# ─────────────────────────────────────────
-@bot.command()
-@commands.has_permissions(manage_roles=True)
-async def reactionrole(ctx, message_id: int, emoji: str, role: discord.Role):
-    """Créer un reaction role. Usage : +reactionrole <message_id> <emoji> <@rôle>"""
-    try:
-        msg = await ctx.channel.fetch_message(message_id)
-    except discord.NotFound:
-        return await ctx.reply("❌ Message introuvable dans ce salon.")
-    gid = str(ctx.guild.id)
-    mid = str(message_id)
-    rreactions_db.setdefault(gid, {}).setdefault(mid, {})[emoji] = {
-        "role_id":    str(role.id),
-        "channel_id": str(ctx.channel.id),
-    }
-    save_rreactions()
-    try:
-        await msg.add_reaction(emoji)
-    except discord.HTTPException:
-        return await ctx.reply("❌ Emoji invalide ou impossible à ajouter.")
-    e = success_embed("✅ Reaction Role créé", f"**Message :** `{message_id}`\n**Emoji :** {emoji}\n**Rôle :** {role.mention}\n\nLes membres obtiennent ce rôle en réagissant avec {emoji}.")
-    await ctx.send(embed=e)
-    await send_log(ctx.guild, e)
-
-@bot.command()
-@commands.has_permissions(manage_roles=True)
-async def removereactionrole(ctx, message_id: int, emoji: str):
-    """Supprimer un reaction role. Usage : +removereactionrole <message_id> <emoji>"""
-    gid = str(ctx.guild.id)
-    mid = str(message_id)
-    if gid not in rreactions_db or mid not in rreactions_db[gid] or emoji not in rreactions_db[gid][mid]:
-        return await ctx.reply("❌ Aucun reaction role trouvé pour cet emoji sur ce message.")
-    del rreactions_db[gid][mid][emoji]
-    if not rreactions_db[gid][mid]:
-        del rreactions_db[gid][mid]
-    save_rreactions()
-    await ctx.reply(embed=success_embed("✅ Reaction Role supprimé", f"L'emoji {emoji} sur le message `{message_id}` ne donne plus de rôle."))
-
-# ─────────────────────────────────────────
-#  RÔLES TEMPORAIRES
-# ─────────────────────────────────────────
-@bot.command()
-@commands.has_permissions(manage_roles=True)
-@commands.bot_has_permissions(manage_roles=True)
-async def temprole(ctx, member: discord.Member, role: discord.Role, duration: str):
-    """Donner un rôle temporairement. Usage : +temprole @membre @rôle <durée>"""
-    delta = parse_duration(duration)
-    if not delta:
-        return await ctx.reply("❌ Durée invalide. Exemples : `10m`, `2h`, `1d`.")
-    if role >= ctx.guild.me.top_role:
-        return await ctx.reply("❌ Je ne peux pas gérer ce rôle (hiérarchie).")
-    await member.add_roles(role, reason=f"Rôle temp par {ctx.author} ({duration})")
-    end_ts = int((datetime.now(timezone.utc) + delta).timestamp())
-    gid = str(ctx.guild.id)
-    key = f"{member.id}_{role.id}"
-    temproles_db.setdefault(gid, {})[key] = {
-        "member_id":  str(member.id),
-        "role_id":    str(role.id),
-        "end_ts":     end_ts,
-        "guild_id":   str(ctx.guild.id),
-    }
-    save_temproles()
-    e = success_embed(
-        "⏳ Rôle temporaire attribué",
-        f"**Membre :** {member.mention}\n**Rôle :** {role.mention}\n**Durée :** {duration}\n**Expiration :** <t:{end_ts}:R>\n**Modérateur :** {ctx.author.mention}"
-    )
-    await ctx.send(embed=e)
-    await send_log(ctx.guild, e)
-
-    async def remove_later():
-        await asyncio.sleep(delta.total_seconds())
-        try:
-            await member.remove_roles(role, reason="Rôle temporaire expiré")
-            temproles_db.get(gid, {}).pop(key, None)
-            save_temproles()
-            re_e = info_embed("⏰ Rôle temporaire expiré", f"**Membre :** {member.mention}\n**Rôle :** {role.mention} retiré automatiquement.")
-            await send_log(ctx.guild, re_e)
-        except Exception:
-            pass
-    asyncio.ensure_future(remove_later())
-
-@tasks.loop(count=1)
-async def check_temproles():
-    """Reprend les temproles persistés au redémarrage."""
-    await bot.wait_until_ready()
-    now = datetime.now(timezone.utc).timestamp()
-    for gid, roles in list(temproles_db.items()):
-        guild = bot.get_guild(int(gid))
-        if not guild:
-            continue
-        for key, rdata in list(roles.items()):
-            remaining = rdata["end_ts"] - now
-            member = guild.get_member(int(rdata["member_id"]))
-            role   = guild.get_role(int(rdata["role_id"]))
-            if not member or not role:
-                roles.pop(key)
-                continue
-            if remaining <= 0:
-                try:
-                    await member.remove_roles(role, reason="Rôle temporaire expiré (reprise)")
-                except Exception:
-                    pass
-                roles.pop(key)
-            else:
-                async def _remove(m=member, r=role, g=guild, g_id=gid, k=key, delay=remaining):
-                    await asyncio.sleep(delay)
-                    try:
-                        await m.remove_roles(r, reason="Rôle temporaire expiré")
-                        temproles_db.get(g_id, {}).pop(k, None)
-                        save_temproles()
-                        re_e = info_embed("⏰ Rôle temporaire expiré", f"**Membre :** {m.mention}\n**Rôle :** {r.mention} retiré automatiquement.")
-                        await send_log(g, re_e)
-                    except Exception:
-                        pass
-                asyncio.ensure_future(_remove())
-        save_temproles()
-
-# ─────────────────────────────────────────
-#  SYSTÈME DE TICKETS
-# ─────────────────────────────────────────
-@bot.command()
-async def ticket(ctx):
-    """Ouvrir un ticket de support."""
-    cfg = get_guild_cfg(ctx.guild.id)
-    cat_id = cfg.get("ticket_category")
-    staff_role_id = cfg.get("ticket_staff_role")
-
-    # Vérifier si le membre a déjà un ticket ouvert
-    gid = str(ctx.guild.id)
-    uid = str(ctx.author.id)
-    existing = tickets_db.get(gid, {}).get(uid)
-    if existing:
-        ch = ctx.guild.get_channel(int(existing.get("channel_id", 0)))
-        if ch:
-            return await ctx.reply(f"❌ Tu as déjà un ticket ouvert : {ch.mention}")
-        else:
-            tickets_db[gid].pop(uid, None)
-
-    category = ctx.guild.get_channel(int(cat_id)) if cat_id else None
-
-    overwrites = {
-        ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        ctx.author:             discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
-        ctx.guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
-    }
-    if staff_role_id:
-        staff_role = ctx.guild.get_role(int(staff_role_id))
-        if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
-    ticket_ch = await ctx.guild.create_text_channel(
-        f"ticket-{ctx.author.name}",
-        category=category,
-        overwrites=overwrites,
-        reason=f"Ticket ouvert par {ctx.author}"
-    )
-
-    tickets_db.setdefault(gid, {})[uid] = {
-        "channel_id": str(ticket_ch.id),
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-    }
-    save_tickets()
-
-    e = discord.Embed(
-        title="🎫 Ticket de support",
-        description=(
-            f"Bienvenue {ctx.author.mention} !\n\n"
-            f"Décris ton problème ou ta demande ci-dessous et le staff te répondra.\n"
-            f"Pour fermer ce ticket : `{PREFIX}closeticket`"
-        ),
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    e.set_footer(text=f"Ticket de {ctx.author}", icon_url=ctx.author.display_avatar.url)
-    await ticket_ch.send(embed=e)
-    if staff_role_id:
-        staff_role = ctx.guild.get_role(int(staff_role_id))
-        if staff_role:
-            await ticket_ch.send(f"{staff_role.mention} — Nouveau ticket !", delete_after=5)
-
-    await ctx.reply(f"✅ Ton ticket a été créé : {ticket_ch.mention}")
-
-@bot.command()
-@commands.has_permissions(manage_channels=True)
-async def closeticket(ctx):
-    """Fermer le ticket courant (dans le salon du ticket)."""
-    # Trouver à qui appartient ce ticket
-    gid = str(ctx.guild.id)
-    owner_uid = None
-    for uid, tdata in tickets_db.get(gid, {}).items():
-        if str(tdata.get("channel_id")) == str(ctx.channel.id):
-            owner_uid = uid
-            break
-    if not owner_uid:
-        return await ctx.reply("❌ Ce salon n'est pas un ticket actif.")
-
-    # Générer un transcript simple
-    transcript_lines = []
-    async for msg in ctx.channel.history(limit=200, oldest_first=True):
-        ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
-        transcript_lines.append(f"[{ts}] {msg.author}: {msg.content}")
-    transcript_text = "\n".join(transcript_lines)
-    transcript_bytes = transcript_text.encode("utf-8")
-
-    # Envoyer le transcript dans le salon de logs
-    cfg = get_guild_cfg(ctx.guild.id)
-    log_ch_id = cfg.get("log_channel")
-    if log_ch_id:
-        log_ch = ctx.guild.get_channel(int(log_ch_id))
-        if log_ch:
-            owner_member = ctx.guild.get_member(int(owner_uid))
-            e = info_embed("🎫 Ticket fermé", f"**Ticket :** {ctx.channel.name}\n**Propriétaire :** {owner_member.mention if owner_member else owner_uid}\n**Fermé par :** {ctx.author.mention}")
-            await log_ch.send(
-                embed=e,
-                file=discord.File(BytesIO(transcript_bytes), filename=f"transcript-{ctx.channel.name}.txt")
-            )
-
-    tickets_db.get(gid, {}).pop(owner_uid, None)
-    save_tickets()
-    await ctx.send("🎫 Ticket fermé. Ce salon sera supprimé dans 5 secondes.")
-    await asyncio.sleep(5)
-    try:
-        await ctx.channel.delete(reason=f"Ticket fermé par {ctx.author}")
-    except discord.Forbidden:
-        pass
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setticket(ctx, *, categorie: str):
-    """Configurer la catégorie des tickets. Usage : +setticket <nom de catégorie>"""
-    cat = discord.utils.get(ctx.guild.categories, name=categorie)
-    if not cat:
-        return await ctx.reply(f"❌ Catégorie `{categorie}` introuvable.")
-    cfg = get_guild_cfg(ctx.guild.id)
-    cfg["ticket_category"] = str(cat.id)
-    save_config()
-    await ctx.reply(f"✅ Catégorie tickets définie sur **{cat.name}**.")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setstaffrole(ctx, role: discord.Role):
-    """Définir le rôle staff pour les tickets. Usage : +setstaffrole @rôle"""
-    cfg = get_guild_cfg(ctx.guild.id)
-    cfg["ticket_staff_role"] = str(role.id)
-    save_config()
-    await ctx.reply(f"✅ Rôle staff tickets défini sur {role.mention}.")
-
-# ─────────────────────────────────────────
-#  SYSTÈME DE MARIAGE
-# ─────────────────────────────────────────
-@bot.command()
-async def marry(ctx, member: discord.Member):
-    """Demander quelqu'un en mariage. Usage : +marry @membre"""
-    if member == ctx.author:
-        return await ctx.reply("❌ Tu ne peux pas te marier avec toi-même.")
-    if member.bot:
-        return await ctx.reply("❌ Tu ne peux pas te marier avec un bot.")
-    gid = str(ctx.guild.id)
-    uid1, uid2 = str(ctx.author.id), str(member.id)
-
-    # Vérifier si l'un des deux est déjà marié
-    marriages = marriages_db.get(gid, {})
-    if uid1 in marriages:
-        partner = ctx.guild.get_member(int(marriages[uid1]))
-        return await ctx.reply(f"❌ Tu es déjà marié(e) avec {partner.mention if partner else marriages[uid1]}.")
-    if uid2 in marriages:
-        partner = ctx.guild.get_member(int(marriages[uid2]))
-        return await ctx.reply(f"❌ {member.mention} est déjà marié(e).")
-
-    e = discord.Embed(
-        title="💍 Demande en mariage",
-        description=f"{ctx.author.mention} demande {member.mention} en mariage !\n\n{member.mention}, acceptes-tu ? Réponds `oui` ou `non` dans les 30 secondes.",
-        color=discord.Color.pink(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    await ctx.send(embed=e)
-
-    def check(m): return m.author == member and m.channel == ctx.channel and m.content.lower() in ("oui", "non")
-    try:
-        response = await bot.wait_for("message", check=check, timeout=30)
-    except asyncio.TimeoutError:
-        return await ctx.send(f"💔 {member.mention} n'a pas répondu à temps. La demande expire.")
-
-    if response.content.lower() == "non":
-        return await ctx.send(f"💔 {member.mention} a refusé la demande de mariage.")
-
-    marriages_db.setdefault(gid, {})[uid1] = uid2
-    marriages_db[gid][uid2] = uid1
-    save_marriages()
-
-    e = discord.Embed(
-        title="💒 Mariage célébré !",
-        description=f"🎊 {ctx.author.mention} et {member.mention} sont maintenant mariés !\nFélicitations ! 💕",
-        color=discord.Color.pink(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    await ctx.send(embed=e)
-
-@bot.command()
-async def divorce(ctx):
-    """Divorcer de ton partenaire actuel."""
-    gid = str(ctx.guild.id)
-    uid = str(ctx.author.id)
-    marriages = marriages_db.get(gid, {})
-    if uid not in marriages:
-        return await ctx.reply("❌ Tu n'es pas marié(e).")
-    partner_id = marriages[uid]
-    partner = ctx.guild.get_member(int(partner_id))
-    marriages.pop(uid, None)
-    marriages.pop(partner_id, None)
-    save_marriages()
-    e = mod_embed("💔 Divorce", f"{ctx.author.mention} a divorcé de {partner.mention if partner else partner_id}.", discord.Color.dark_red())
-    await ctx.send(embed=e)
-
-@bot.command()
-async def couples(ctx):
-    """Voir tous les couples mariés sur ce serveur."""
-    gid = str(ctx.guild.id)
-    marriages = marriages_db.get(gid, {})
-    if not marriages:
-        return await ctx.reply("💔 Aucun couple sur ce serveur.")
-    seen = set()
-    lines = []
-    for uid1, uid2 in marriages.items():
-        pair = tuple(sorted([uid1, uid2]))
-        if pair in seen:
-            continue
-        seen.add(pair)
-        m1 = ctx.guild.get_member(int(uid1))
-        m2 = ctx.guild.get_member(int(uid2))
-        n1 = m1.display_name if m1 else f"<@{uid1}>"
-        n2 = m2.display_name if m2 else f"<@{uid2}>"
-        lines.append(f"💕 **{n1}** & **{n2}**")
-    e = discord.Embed(title="💒 Couples du serveur", description="\n".join(lines) or "Aucun couple.", color=discord.Color.pink(), timestamp=datetime.now(timezone.utc))
+        channel = ctx.guild.get_channel(g["channel_id"])
+        ch_mention = channel.mention if channel else "Salon supprimé"
+        e.add_field(
+            name=f"🎁 {g['prize']}",
+            value=f"ID : `{mid}`\nSalon : {ch_mention}\nFin : <t:{g['end_ts']}:R>\nGagnants : {g['winners']}",
+            inline=False
+        )
     await ctx.send(embed=e)
 
 # ─────────────────────────────────────────
 #  UTILITAIRES
 # ─────────────────────────────────────────
-@bot.command()
-async def stats(ctx):
-    """Afficher les statistiques détaillées du serveur (comme sur l'image)."""
-    g = ctx.guild
-
-    # Compter les membres en ligne, hors ligne, en vocal, en stream, muets
-    online = offline = in_voice = streaming = voice_muted = 0
-    for member in g.members:
-        if member.bot:
-            continue
-        if member.status in (discord.Status.online, discord.Status.idle, discord.Status.dnd):
-            online += 1
-        else:
-            offline += 1
-        if member.voice:
-            in_voice += 1
-            if member.voice.self_stream or member.voice.self_video:
-                streaming += 1
-            if member.voice.self_mute or member.voice.mute:
-                voice_muted += 1
-
-    boosts = g.premium_subscription_count or 0
-    total  = g.member_count or 0
-
-    e = discord.Embed(
-        title=f"🏆 {g.name} — Statistiques",
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    if g.icon:
-        e.set_thumbnail(url=g.icon.url)
-
-    e.add_field(
-        name="👥 Membres",
-        value=(
-            f"👤 **Membres** — {total}\n"
-            f"🟢 **En ligne** — {online}\n"
-            f"⚫ **Hors ligne** — {offline}"
-        ),
-        inline=True
-    )
-    e.add_field(
-        name="🎙️ Vocal",
-        value=(
-            f"🔊 **En vocal** — {in_voice}\n"
-            f"📡 **En stream** — {streaming}\n"
-            f"🔇 **Mute** — {voice_muted}"
-        ),
-        inline=True
-    )
-    e.add_field(
-        name="✨ Boosts",
-        value=f"<:boost:1> **Boosts** — {boosts}\n⭐ **Niveau** — {g.premium_tier}",
-        inline=False
-    )
-    e.add_field(
-        name="📊 Activité bot",
-        value=(
-            f"💬 **Commandes utilisées** — {_bot_stats['commands_used']}\n"
-            f"🤖 **Actions AutoMod** — {_bot_stats['automod_actions']}\n"
-            f"📨 **Messages (session)** — {_bot_stats['messages_today']}"
-        ),
-        inline=False
-    )
-    e.add_field(
-        name="🏠 Serveur",
-        value=(
-            f"📝 **Salons texte** — {len(g.text_channels)}\n"
-            f"🔊 **Salons vocaux** — {len(g.voice_channels)}\n"
-            f"🏷️ **Rôles** — {len(g.roles)}"
-        ),
-        inline=True
-    )
-    e.set_footer(text=f"Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
-    await ctx.send(embed=e)
-
-@bot.command()
-async def botinfo(ctx):
-    """Afficher les informations et statistiques du bot."""
-    delta = datetime.now(timezone.utc) - _start_time
-    hours, remainder = divmod(int(delta.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    days = hours // 24
-    hours %= 24
-    uptime_str = f"{days}j {hours}h {minutes}m {seconds}s"
-
-    total_members = sum(g.member_count for g in bot.guilds)
-    total_commands = len(list(bot.commands))
-
-    e = discord.Embed(
-        title=f"🤖 {bot.user.name} — Informations",
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    if bot.user.avatar:
-        e.set_thumbnail(url=bot.user.avatar.url)
-
-    e.add_field(name="🏷️ Nom",         value=str(bot.user),               inline=True)
-    e.add_field(name="🔢 ID",           value=str(bot.user.id),            inline=True)
-    e.add_field(name="🌐 Serveurs",     value=str(len(bot.guilds)),         inline=True)
-    e.add_field(name="👥 Membres",      value=str(total_members),           inline=True)
-    e.add_field(name="⚙️ Commandes",    value=str(total_commands),          inline=True)
-    e.add_field(name="🏓 Latence",      value=f"{round(bot.latency*1000)}ms", inline=True)
-    e.add_field(name="⏱️ Uptime",       value=uptime_str,                   inline=True)
-    e.add_field(name="🚀 Démarré",      value=f"<t:{int(_start_time.timestamp())}:R>", inline=True)
-    e.add_field(name="📚 Bibliothèque", value=f"discord.py {discord.__version__}", inline=True)
-    e.add_field(name="🐍 Python",       value=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}", inline=True)
-    e.add_field(name="📊 Stats session",
-                value=f"💬 Commandes : {_bot_stats['commands_used']}\n🤖 AutoMod : {_bot_stats['automod_actions']}\n📨 Messages : {_bot_stats['messages_today']}",
-                inline=False)
-    e.add_field(name="💾 Données",
-                value=f"⚠️ Warns enregistrés : {sum(len(v) for gw in warns_db.values() for v in gw.values())}\n🎉 Giveaways : {sum(len(v) for v in giveaway_db.values())}\n💒 Mariages : {len(marriages_db.get(str(ctx.guild.id), {})) // 2}",
-                inline=False)
-    e.set_footer(text=f"Préfixe : {PREFIX}  •  Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
-    await ctx.send(embed=e)
+_start_time = datetime.now(timezone.utc)
 
 @bot.command()
 async def ping(ctx):
@@ -1768,8 +1167,9 @@ async def uptime(ctx):
     hours, remainder = divmod(int(delta.total_seconds()), 3600)
     minutes, seconds = divmod(remainder, 60)
     days = hours // 24
-    hours %= 24
-    e = info_embed("⏱️ Uptime", f"En ligne depuis **{days}j {hours}h {minutes}m {seconds}s**.\n**Démarré :** <t:{int(_start_time.timestamp())}:R>")
+    hours = hours % 24
+    uptime_str = f"{days}j {hours}h {minutes}m {seconds}s"
+    e = info_embed("⏱️ Uptime", f"Le bot est en ligne depuis **{uptime_str}**.\n**Démarré :** <t:{int(_start_time.timestamp())}:R>")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1787,52 +1187,47 @@ async def calc(ctx, *, expression: str):
     except Exception:
         await ctx.reply("❌ Expression invalide.")
 
-@bot.command(name="8ball")
-async def eight_ball(ctx, *, question: str):
-    """Boule magique. Usage : +8ball <question>"""
-    reponses = [
-        "✅ C'est certain.", "✅ Oui, absolument.", "✅ Sans aucun doute.",
-        "✅ Oui, définitivement.", "✅ Tu peux compter dessus.",
-        "🟡 À première vue, oui.", "🟡 Les signes sont favorables.", "🟡 Les perspectives sont bonnes.",
-        "🟡 Tout indique que oui.", "🟡 C'est très probable.",
-        "🟠 C'est flou, réessaie.", "🟠 Je préfère ne pas répondre.",
-        "🟠 Je ne peux pas prédire ça maintenant.", "🟠 Concentre-toi et redemande.",
-        "❌ N'y compte pas.", "❌ Ma réponse est non.", "❌ Mes sources disent non.",
-        "❌ Les perspectives ne sont pas bonnes.", "❌ C'est très incertain.",
-    ]
-    e = discord.Embed(
-        title="🎱 Boule Magique",
-        color=discord.Color.dark_purple(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    e.add_field(name="❓ Question", value=question, inline=False)
-    e.add_field(name="🔮 Réponse", value=random.choice(reponses), inline=False)
-    e.set_footer(text=f"Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
-    await ctx.send(embed=e)
 
 @bot.command(name="create")
 @commands.has_permissions(manage_emojis=True)
 @commands.bot_has_permissions(manage_emojis=True)
 async def create_emoji(ctx, emoji: discord.PartialEmoji):
     """Voler un emoji d'un autre serveur et l'ajouter ici."""
+
     if len(ctx.guild.emojis) >= ctx.guild.emoji_limit:
         return await ctx.reply("❌ La limite d'emojis du serveur est atteinte.")
+
     try:
         async with ctx.bot.http._HTTPClient__session.get(str(emoji.url)) as resp:
             if resp.status != 200:
                 return await ctx.reply("❌ Impossible de télécharger cet emoji.")
+
             data = await resp.read()
-        new_emoji = await ctx.guild.create_custom_emoji(name=emoji.name, image=data, reason=f"Emoji ajouté par {ctx.author}")
-        e = success_embed("✅ Emoji ajouté", f"Emoji créé : {new_emoji}\nNom : `{new_emoji.name}`\nAjouté par : {ctx.author.mention}")
+
+        new_emoji = await ctx.guild.create_custom_emoji(
+            name=emoji.name,
+            image=data,
+            reason=f"Emoji ajouté par {ctx.author}"
+        )
+
+        e = success_embed(
+            "✅ Emoji ajouté",
+            f"Emoji créé avec succès : {new_emoji}\nNom : `{new_emoji.name}`\nAjouté par : {ctx.author.mention}"
+        )
+
         await ctx.send(embed=e)
+        await send_log(ctx.guild, e)
+
     except discord.HTTPException:
         await ctx.reply("❌ Impossible d'ajouter cet emoji.")
+
 
 @bot.command()
 async def coinflip(ctx):
     """Lancer une pièce — Pile ou Face."""
     result = random.choice(["🪙 **Pile !**", "🪙 **Face !**"])
-    await ctx.send(embed=info_embed("🪙 Pile ou Face", result))
+    e = info_embed("🪙 Pile ou Face", result)
+    await ctx.send(embed=e)
 
 @bot.command()
 async def roll(ctx, dice: str = "1d6"):
@@ -1842,17 +1237,18 @@ async def roll(ctx, dice: str = "1d6"):
         return await ctx.reply("❌ Format invalide. Exemple : `2d6`, `1d20`.")
     nb, faces = int(m.group(1)), int(m.group(2))
     if nb < 1 or nb > 20 or faces < 2 or faces > 100:
-        return await ctx.reply("❌ Entre 1-20 dés, 2-100 faces.")
+        return await ctx.reply("❌ Entre 1 et 20 dés, 2 à 100 faces.")
     results = [random.randint(1, faces) for _ in range(nb)]
     total = sum(results)
     rolls_str = " + ".join(str(r) for r in results) if nb > 1 else str(results[0])
     desc = f"🎲 **{dice}** → {rolls_str}" + (f" = **{total}**" if nb > 1 else "")
-    await ctx.send(embed=info_embed("🎲 Lancer de dés", desc))
+    e = info_embed("🎲 Lancer de dés", desc)
+    await ctx.send(embed=e)
 
 @bot.command()
 @commands.has_permissions(manage_messages=True)
 async def say(ctx, *, message: str):
-    """Faire parler le bot. Usage : +say <message>"""
+    """Faire parler le bot dans le salon. Usage : +say <message>"""
     await ctx.message.delete()
     await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
 
@@ -1876,32 +1272,78 @@ async def poll(ctx, *, contenu: str):
     for i in range(len(options)):
         await msg.add_reaction(emojis[i])
 
+
 @bot.command(name="snipe")
 @commands.has_permissions(manage_messages=True)
 async def snipe(ctx, member: discord.Member):
-    """Afficher les derniers messages supprimés d'un membre."""
-    gid, uid = ctx.guild.id, member.id
+    """Afficher les 10 derniers messages supprimés d'un membre."""
+
+    gid = ctx.guild.id
+    uid = member.id
+
     entries = _snipe_cache.get(gid, {}).get(uid, [])
+
     if not entries:
         return await ctx.reply("❌ Aucun message supprimé récent trouvé.")
+
     now = datetime.now(timezone.utc)
-    valid = [e for e in reversed(entries) if now - datetime.fromisoformat(e["created_at"]) <= SNIPE_MAX_AGE][:10]
-    if not valid:
-        return await ctx.reply("❌ Aucun message supprimé récent trouvé.")
-    e = warning_embed(f"🕵️ Messages supprimés de {member}", "")
-    for i, entry in enumerate(valid, 1):
-        ch = ctx.guild.get_channel(entry["channel_id"])
-        content = (entry["content"] or "[vide]")[:800]
+    valid_entries = []
+
+    for entry in reversed(entries):
         try:
-            ts = f"<t:{int(datetime.fromisoformat(entry['created_at']).timestamp())}:R>"
+            ts = datetime.fromisoformat(entry["created_at"])
+
+            if now - ts <= SNIPE_MAX_AGE:
+                valid_entries.append(entry)
+
         except Exception:
-            ts = "?"
-        val = f"**Salon :** {ch.mention if ch else '?'}\n**Supprimé :** {ts}\n\n{content}"
+            pass
+
+    if not valid_entries:
+        return await ctx.reply("❌ Aucun message supprimé récent trouvé.")
+
+    valid_entries = valid_entries[:10]
+
+    e = warning_embed(
+        f"🕵️ 10 derniers messages supprimés de {member}",
+        ""
+    )
+
+    for i, entry in enumerate(valid_entries, 1):
+
+        channel = ctx.guild.get_channel(entry["channel_id"])
+        channel_name = channel.mention if channel else "Salon inconnu"
+
+        content = entry["content"] or "[Message vide]"
+
+        if len(content) > 800:
+            content = content[:800] + "..."
+
+        try:
+            ts = datetime.fromisoformat(entry["created_at"])
+            time_str = f"<t:{int(ts.timestamp())}:R>"
+        except Exception:
+            time_str = "Temps inconnu"
+
+        value = (
+            f"**Salon :** {channel_name}\n"
+            f"**Supprimé :** {time_str}\n\n"
+            f"{content}"
+        )
+
         if entry.get("attachments"):
-            val += "\n\n📎 " + "\n".join(entry["attachments"][:3])
-        e.add_field(name=f"Message #{i}", value=val[:1024], inline=False)
+            value += "\n\n📎 " + "\n".join(entry["attachments"][:3])
+
+        e.add_field(
+            name=f"Message #{i}",
+            value=value[:1024],
+            inline=False
+        )
+
     e.set_thumbnail(url=member.display_avatar.url)
+
     await ctx.send(embed=e)
+
 
 @bot.command()
 async def remind(ctx, duration: str, *, message: str):
@@ -1912,6 +1354,7 @@ async def remind(ctx, duration: str, *, message: str):
     end_ts = int((datetime.now(timezone.utc) + delta).timestamp())
     e = info_embed("⏰ Rappel créé", f"Je te rappellerai <t:{end_ts}:R> :\n**{message}**")
     await ctx.reply(embed=e)
+
     async def do_remind():
         await asyncio.sleep(delta.total_seconds())
         e2 = warning_embed("⏰ Rappel !", f"{ctx.author.mention}, tu voulais te souvenir de :\n**{message}**")
@@ -1922,6 +1365,7 @@ async def remind(ctx, duration: str, *, message: str):
                 await ctx.author.send(embed=e2)
             except Exception:
                 pass
+
     asyncio.ensure_future(do_remind())
 
 @bot.command()
@@ -1940,8 +1384,13 @@ async def embed(ctx, *, contenu: str):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def announce(ctx, *, message: str):
-    """Faire une annonce en embed. Usage : +announce <message>"""
-    e = discord.Embed(title="📢 Annonce", description=message, color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+    """Faire une annonce en embed dans le salon courant. Usage : +announce <message>"""
+    e = discord.Embed(
+        title="📢 Annonce",
+        description=message,
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
     e.set_footer(text=f"Par {ctx.author}", icon_url=ctx.author.display_avatar.url)
     await ctx.message.delete()
     await ctx.send("@everyone", embed=e)
@@ -1951,7 +1400,7 @@ async def announce(ctx, *, message: str):
 # ─────────────────────────────────────────
 @bot.command()
 async def avatar(ctx, member: discord.Member = None):
-    """Afficher l'avatar d'un membre."""
+    """Afficher l'avatar d'un membre. Usage : +avatar [@membre]"""
     member = member or ctx.author
     e = discord.Embed(title=f"🖼️ Avatar de {member}", color=member.color)
     e.set_image(url=member.display_avatar.url)
@@ -1962,9 +1411,9 @@ async def avatar(ctx, member: discord.Member = None):
 @commands.has_permissions(manage_roles=True)
 @commands.bot_has_permissions(manage_roles=True)
 async def addrole(ctx, member: discord.Member, role: discord.Role):
-    """Donner un rôle à un membre."""
+    """Donner un rôle à un membre. Usage : +addrole @membre @rôle"""
     if role in member.roles:
-        return await ctx.reply(f"❌ {member.mention} a déjà {role.mention}.")
+        return await ctx.reply(f"❌ {member.mention} a déjà le rôle {role.mention}.")
     await member.add_roles(role, reason=f"Ajouté par {ctx.author}")
     e = success_embed("✅ Rôle ajouté", f"**Membre :** {member.mention}\n**Rôle :** {role.mention}\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
@@ -1974,9 +1423,9 @@ async def addrole(ctx, member: discord.Member, role: discord.Role):
 @commands.has_permissions(manage_roles=True)
 @commands.bot_has_permissions(manage_roles=True)
 async def removerole(ctx, member: discord.Member, role: discord.Role):
-    """Retirer un rôle d'un membre."""
+    """Retirer un rôle d'un membre. Usage : +removerole @membre @rôle"""
     if role not in member.roles:
-        return await ctx.reply(f"❌ {member.mention} n'a pas {role.mention}.")
+        return await ctx.reply(f"❌ {member.mention} n'a pas le rôle {role.mention}.")
     await member.remove_roles(role, reason=f"Retiré par {ctx.author}")
     e = mod_embed("✅ Rôle retiré", f"**Membre :** {member.mention}\n**Rôle :** {role.mention}\n**Modérateur :** {ctx.author.mention}", discord.Color.orange())
     await ctx.send(embed=e)
@@ -1985,7 +1434,7 @@ async def removerole(ctx, member: discord.Member, role: discord.Role):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def autorole(ctx, role: discord.Role):
-    """Définir le rôle automatiquement donné aux nouveaux membres."""
+    """Définir le rôle automatiquement donné aux nouveaux membres. Usage : +autorole @rôle"""
     cfg = get_guild_cfg(ctx.guild.id)
     cfg["auto_role"] = role.id
     save_config()
@@ -1994,12 +1443,18 @@ async def autorole(ctx, role: discord.Role):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setwelcome(ctx, channel: discord.TextChannel, *, message: str):
-    """Configurer le message de bienvenue. Variables : {mention}, {name}, {server}"""
+    """Configurer le message de bienvenue. Usage : +setwelcome #salon <message>
+    
+    Variables : {mention}, {name}, {server}
+    """
     cfg = get_guild_cfg(ctx.guild.id)
     cfg["welcome_channel"] = channel.id
     cfg["welcome_message"]  = message
     save_config()
-    preview = message.replace("{mention}", ctx.author.mention).replace("{server}", ctx.guild.name).replace("{name}", str(ctx.author))
+    preview = (message
+               .replace("{mention}", ctx.author.mention)
+               .replace("{server}", ctx.guild.name)
+               .replace("{name}", str(ctx.author)))
     e = success_embed("✅ Message de bienvenue configuré", "")
     e.add_field(name="Salon", value=channel.mention, inline=True)
     e.add_field(name="Aperçu", value=preview, inline=False)
@@ -2012,19 +1467,14 @@ async def userinfo(ctx, member: discord.Member = None):
     roles  = [r.mention for r in member.roles if r != ctx.guild.default_role]
     gid, uid = str(ctx.guild.id), str(member.id)
     warn_count = len(warns_db.get(gid, {}).get(uid, []))
-    married_to = marriages_db.get(gid, {}).get(uid)
-
     e = discord.Embed(title=f"👤 {member}", color=member.color, timestamp=datetime.now(timezone.utc))
     e.set_thumbnail(url=member.display_avatar.url)
-    e.add_field(name="ID",          value=member.id,                                     inline=True)
-    e.add_field(name="Surnom",      value=member.nick or "Aucun",                        inline=True)
-    e.add_field(name="Bot",         value="✅" if member.bot else "❌",                   inline=True)
+    e.add_field(name="ID",          value=member.id,                                    inline=True)
+    e.add_field(name="Surnom",      value=member.nick or "Aucun",                       inline=True)
+    e.add_field(name="Bot",         value="✅" if member.bot else "❌",                  inline=True)
     e.add_field(name="Compte créé", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
     e.add_field(name="A rejoint",   value=f"<t:{int(member.joined_at.timestamp())}:R>",  inline=True)
-    e.add_field(name="⚠️ Warns",    value=str(warn_count),                              inline=True)
-    if married_to:
-        partner = ctx.guild.get_member(int(married_to))
-        e.add_field(name="💍 Marié(e) à", value=partner.mention if partner else f"<@{married_to}>", inline=True)
+    e.add_field(name="⚠️ Warns",   value=str(warn_count),                              inline=True)
     e.add_field(name=f"Rôles ({len(roles)})", value=" ".join(roles) if roles else "Aucun", inline=False)
     if member.timed_out_until and member.timed_out_until > datetime.now(timezone.utc):
         e.add_field(name="🔇 Muet jusqu'à", value=f"<t:{int(member.timed_out_until.timestamp())}:R>", inline=False)
@@ -2032,7 +1482,8 @@ async def userinfo(ctx, member: discord.Member = None):
 
 @bot.command()
 async def whois(ctx, member: discord.Member = None):
-    """Alias de userinfo."""
+    """Alias de userinfo. Usage : +whois [@membre]"""
+    ctx.command = bot.get_command("userinfo")
     await ctx.invoke(bot.get_command("userinfo"), member=member)
 
 @bot.command()
@@ -2042,31 +1493,31 @@ async def serverinfo(ctx):
     e = info_embed(f"🏠 {g.name}", "")
     if g.icon:
         e.set_thumbnail(url=g.icon.url)
-    e.add_field(name="ID",            value=g.id,                                         inline=True)
-    e.add_field(name="Propriétaire",  value=g.owner.mention,                              inline=True)
-    e.add_field(name="Membres",       value=g.member_count,                               inline=True)
-    e.add_field(name="Salons texte",  value=len(g.text_channels),                         inline=True)
-    e.add_field(name="Salons vocaux", value=len(g.voice_channels),                        inline=True)
-    e.add_field(name="Rôles",         value=len(g.roles),                                 inline=True)
-    e.add_field(name="Emojis",        value=f"{len(g.emojis)}/{g.emoji_limit}",           inline=True)
-    e.add_field(name="Niveau boost",  value=f"⭐ Niveau {g.premium_tier}",                inline=True)
-    e.add_field(name="Boosts",        value=g.premium_subscription_count or 0,            inline=True)
-    e.add_field(name="Créé le",       value=f"<t:{int(g.created_at.timestamp())}:F>",     inline=False)
+    e.add_field(name="ID",             value=g.id,                                         inline=True)
+    e.add_field(name="Propriétaire",   value=g.owner.mention,                              inline=True)
+    e.add_field(name="Membres",        value=g.member_count,                               inline=True)
+    e.add_field(name="Salons texte",   value=len(g.text_channels),                         inline=True)
+    e.add_field(name="Salons vocaux",  value=len(g.voice_channels),                        inline=True)
+    e.add_field(name="Rôles",          value=len(g.roles),                                 inline=True)
+    e.add_field(name="Emojis",         value=f"{len(g.emojis)}/{g.emoji_limit}",           inline=True)
+    e.add_field(name="Niveau boost",   value=f"⭐ Niveau {g.premium_tier}",                inline=True)
+    e.add_field(name="Boosts",         value=g.premium_subscription_count or 0,            inline=True)
+    e.add_field(name="Créé le",        value=f"<t:{int(g.created_at.timestamp())}:F>",     inline=False)
     if g.banner:
         e.set_image(url=g.banner.url)
     await ctx.send(embed=e)
 
 @bot.command()
 async def roleinfo(ctx, role: discord.Role):
-    """Afficher les informations d'un rôle."""
+    """Afficher les informations d'un rôle. Usage : +roleinfo @rôle"""
     perms = [p.replace("_", " ").title() for p, v in role.permissions if v]
     e = discord.Embed(title=f"🏷️ Rôle : {role.name}", color=role.color, timestamp=datetime.now(timezone.utc))
-    e.add_field(name="ID",           value=role.id,                         inline=True)
-    e.add_field(name="Couleur",      value=str(role.color),                 inline=True)
-    e.add_field(name="Membres",      value=len(role.members),               inline=True)
-    e.add_field(name="Mentionnable", value="✅" if role.mentionable else "❌", inline=True)
-    e.add_field(name="Hoisted",      value="✅" if role.hoist else "❌",     inline=True)
-    e.add_field(name="Créé le",      value=f"<t:{int(role.created_at.timestamp())}:R>", inline=True)
+    e.add_field(name="ID",          value=role.id,                      inline=True)
+    e.add_field(name="Couleur",     value=str(role.color),              inline=True)
+    e.add_field(name="Membres",     value=len(role.members),            inline=True)
+    e.add_field(name="Mentionnable",value="✅" if role.mentionable else "❌", inline=True)
+    e.add_field(name="Hoisted",     value="✅" if role.hoist else "❌", inline=True)
+    e.add_field(name="Créé le",     value=f"<t:{int(role.created_at.timestamp())}:R>", inline=True)
     if perms:
         e.add_field(name=f"Permissions ({len(perms)})", value=", ".join(perms[:15]) + ("..." if len(perms) > 15 else ""), inline=False)
     await ctx.send(embed=e)
@@ -2095,6 +1546,7 @@ async def setmuterole(ctx, role: discord.Role):
 # ─────────────────────────────────────────
 #  AUTOMOD — Commande principale
 # ─────────────────────────────────────────
+# Mapping des noms de règles pour les sous-commandes
 AUTOMOD_RULES = {
     "links":    "anti_links",
     "invites":  "anti_invites",
@@ -2104,13 +1556,32 @@ AUTOMOD_RULES = {
     "badwords": "anti_badwords",
     "zalgo":    "anti_zalgo",
     "flood":    "anti_flood",
-    "scam":     "anti_scam",
 }
 
 @bot.command(name="automod")
 @commands.has_permissions(administrator=True)
 async def automod_cmd(ctx, sous_commande: str = "status", *args):
-    """Gérer l'automod du serveur."""
+    """Gérer l'automod du serveur.
+
+    Sous-commandes :
+      status                          — Voir la configuration
+      enable / disable                — Activer / désactiver l'automod
+      set <règle> on/off              — Activer/désactiver une règle
+      action <delete|warn|mute|kick>  — Choisir l'action automatique
+      mute_duration <durée>           — Durée du mute auto (ex: 10m)
+      spam_threshold <nb>             — Nb de messages = spam
+      spam_interval <sec>             — Fenêtre en secondes
+      caps_percent <nb>               — Seuil % majuscules (1-100)
+      max_mentions <nb>               — Nb max de @mentions
+      flood_count <nb>                — Nb de messages identiques = flood
+      badword add <mot>               — Ajouter un mot interdit
+      badword remove <mot>            — Supprimer un mot interdit
+      badword list                    — Lister les mots interdits
+      exempt_role @rôle add/remove    — Exempter un rôle
+      exempt_channel #salon add/remove — Exempter un salon
+
+    Règles disponibles : links, invites, spam, caps, mentions, badwords, zalgo, flood
+    """
     am_cfg = get_automod_cfg(ctx.guild.id)
     sc = sous_commande.lower()
 
@@ -2119,33 +1590,37 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
         def oc(val): return "🟢 ON" if val else "🔴 OFF"
         exempt_roles    = [ctx.guild.get_role(int(r)) for r in am_cfg.get("exempt_roles", []) if ctx.guild.get_role(int(r))]
         exempt_channels = [ctx.guild.get_channel(int(c)) for c in am_cfg.get("exempt_channels", []) if ctx.guild.get_channel(int(c))]
-        whitelist = am_cfg.get("whitelist_domains", [])
 
-        e = discord.Embed(title="🛡️ Configuration AutoMod", color=discord.Color.blurple() if am_cfg.get("enabled") else discord.Color.greyple(), timestamp=datetime.now(timezone.utc))
-        e.add_field(name="🔘 Statut global", value=oc(am_cfg.get("enabled")), inline=False)
+        e = discord.Embed(
+            title="🛡️ Configuration AutoMod",
+            color=discord.Color.blurple() if am_cfg.get("enabled") else discord.Color.greyple(),
+            timestamp=datetime.now(timezone.utc)
+        )
         e.add_field(
-            name="📋 Règles",
+            name="🔘 Statut global",
+            value=oc(am_cfg.get("enabled")),
+            inline=False
+        )
+        e.add_field(
+            name="📋 Règles actives",
             value=(
-                f"{oc(am_cfg.get('anti_links'))} **Anti-liens** *(GIFs autorisés)*\n"
+                f"{oc(am_cfg.get('anti_links'))} **Anti-liens**\n"
                 f"{oc(am_cfg.get('anti_invites'))} **Anti-invitations Discord**\n"
-                f"{oc(am_cfg.get('anti_spam'))} **Anti-spam** ({am_cfg.get('spam_threshold')} msg/{am_cfg.get('spam_interval')}s)\n"
-                f"{oc(am_cfg.get('anti_caps'))} **Anti-majuscules** ({am_cfg.get('caps_percent')}%)\n"
-                f"{oc(am_cfg.get('anti_mentions'))} **Anti-@mentions** (max {am_cfg.get('max_mentions')})\n"
+                f"{oc(am_cfg.get('anti_spam'))} **Anti-spam** (seuil : {am_cfg.get('spam_threshold')} msg/{am_cfg.get('spam_interval')}s)\n"
+                f"{oc(am_cfg.get('anti_caps'))} **Anti-majuscules** (seuil : {am_cfg.get('caps_percent')}%)\n"
+                f"{oc(am_cfg.get('anti_mentions'))} **Anti-@mentions** (max : {am_cfg.get('max_mentions')})\n"
                 f"{oc(am_cfg.get('anti_badwords'))} **Mots interdits** ({len(am_cfg.get('badwords', []))} mot(s))\n"
                 f"{oc(am_cfg.get('anti_zalgo'))} **Anti-Zalgo**\n"
-                f"{oc(am_cfg.get('anti_flood'))} **Anti-flood** (seuil {am_cfg.get('flood_count')})\n"
-                f"{oc(am_cfg.get('anti_scam'))} **Anti-scam**"
+                f"{oc(am_cfg.get('anti_flood'))} **Anti-flood** (seuil : {am_cfg.get('flood_count')} messages identiques)"
             ),
             inline=False
         )
-        threshold = am_cfg.get("warn_threshold", 0)
         e.add_field(
-            name="⚙️ Action & Seuil Warns",
+            name="⚙️ Action",
             value=(
                 f"**Action :** `{am_cfg.get('action', 'delete')}`\n"
                 f"**Durée mute auto :** `{am_cfg.get('mute_duration', '10m')}`\n"
-                f"**Seuil warns :** `{threshold if threshold > 0 else 'désactivé'}`"
-                + (f"\n**Action au seuil :** `{am_cfg.get('warn_action')}` ({am_cfg.get('warn_action_dur')})" if threshold > 0 else "") + f"\n**Log automod :** {oc(am_cfg.get('log_automod', True))}"
+                f"**Log automod :** {oc(am_cfg.get('log_automod', True))}"
             ),
             inline=True
         )
@@ -2153,8 +1628,7 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
             name="🚫 Exemptions",
             value=(
                 f"**Rôles :** {', '.join(r.mention for r in exempt_roles) or 'Aucun'}\n"
-                f"**Salons :** {', '.join(c.mention for c in exempt_channels) or 'Aucun'}\n"
-                f"**Domaines whitelist :** {', '.join(f'`{d}`' for d in whitelist) or 'Aucun'}"
+                f"**Salons :** {', '.join(c.mention for c in exempt_channels) or 'Aucun'}"
             ),
             inline=True
         )
@@ -2173,7 +1647,7 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
             return await ctx.reply("❌ Usage : `+automod set <règle> on/off`\nRègles : " + ", ".join(AUTOMOD_RULES.keys()))
         rule_name, toggle = args[0].lower(), args[1].lower()
         if rule_name not in AUTOMOD_RULES:
-            return await ctx.reply(f"❌ Règle inconnue. Disponibles : `{'`, `'.join(AUTOMOD_RULES.keys())}`")
+            return await ctx.reply(f"❌ Règle inconnue. Règles disponibles : `{'`, `'.join(AUTOMOD_RULES.keys())}`")
         if toggle not in ("on", "off"):
             return await ctx.reply("❌ Valeur : `on` ou `off`.")
         am_cfg[AUTOMOD_RULES[rule_name]] = (toggle == "on")
@@ -2184,118 +1658,79 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
     # ── ACTION ────────────────────────────────────────────────────────────
     elif sc == "action":
         if not args:
-            return await ctx.reply("❌ Usage : `+automod action <delete|warn|mute|kick|ban>`")
+            return await ctx.reply("❌ Usage : `+automod action <delete|warn|mute|kick>`")
         action = args[0].lower()
-        if action not in ("delete", "warn", "mute", "kick", "ban"):
-            return await ctx.reply("❌ Actions : `delete`, `warn`, `mute`, `kick`, `ban`.")
+        if action not in ("delete", "warn", "mute", "kick"):
+            return await ctx.reply("❌ Actions disponibles : `delete`, `warn`, `mute`, `kick`.")
         am_cfg["action"] = action
         save_config()
         await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Action définie sur **{action}**."))
 
     # ── MUTE_DURATION ─────────────────────────────────────────────────────
     elif sc == "mute_duration":
-        if not args or not parse_duration(args[0]):
+        if not args:
             return await ctx.reply("❌ Usage : `+automod mute_duration <durée>` (ex : `10m`, `1h`)")
-        am_cfg["mute_duration"] = args[0]
+        dur = args[0]
+        if not parse_duration(dur):
+            return await ctx.reply("❌ Durée invalide. Exemples : `10m`, `1h`, `30s`.")
+        am_cfg["mute_duration"] = dur
         save_config()
-        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Durée de mute auto : **{args[0]}**."))
-
-    # ── WARN_THRESHOLD ────────────────────────────────────────────────────
-    elif sc == "warn_threshold":
-        if not args or not args[0].isdigit():
-            return await ctx.reply("❌ Usage : `+automod warn_threshold <nombre>` (0 = désactivé)")
-        val = int(args[0])
-        am_cfg["warn_threshold"] = val
-        save_config()
-        msg = f"Seuil warns défini sur **{val}**." if val > 0 else "Seuil warns **désactivé**."
-        await ctx.reply(embed=success_embed("🛡️ AutoMod", msg))
-
-    # ── WARN_ACTION ───────────────────────────────────────────────────────
-    elif sc == "warn_action":
-        if not args or args[0].lower() not in ("mute", "kick", "ban", "tempban"):
-            return await ctx.reply("❌ Usage : `+automod warn_action <mute|kick|ban|tempban>`")
-        am_cfg["warn_action"] = args[0].lower()
-        if len(args) >= 2 and parse_duration(args[1]):
-            am_cfg["warn_action_dur"] = args[1]
-        save_config()
-        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Action au seuil de warns : **{args[0]}**."))
-
-    # ── WHITELIST_DOMAIN ──────────────────────────────────────────────────
-    elif sc == "whitelist_domain":
-        if len(args) < 2:
-            return await ctx.reply("❌ Usage : `+automod whitelist_domain add/remove <domaine>`")
-        action = args[0].lower()
-        domain = args[1].lower()
-        whitelist = am_cfg.setdefault("whitelist_domains", [])
-        if action == "add":
-            if domain in whitelist:
-                return await ctx.reply(f"❌ `{domain}` est déjà dans la whitelist.")
-            whitelist.append(domain)
-            save_config()
-            await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Domaine `{domain}` ajouté à la whitelist."))
-        elif action == "remove":
-            if domain not in whitelist:
-                return await ctx.reply(f"❌ `{domain}` n'est pas dans la whitelist.")
-            whitelist.remove(domain)
-            save_config()
-            await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Domaine `{domain}` retiré de la whitelist."))
-        else:
-            await ctx.reply("❌ Action invalide. Utilise `add` ou `remove`.")
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Durée de mute auto définie sur **{dur}**."))
 
     # ── SPAM_THRESHOLD ────────────────────────────────────────────────────
     elif sc == "spam_threshold":
         if not args or not args[0].isdigit():
             return await ctx.reply("❌ Usage : `+automod spam_threshold <nombre>`")
         val = int(args[0])
-        if not 2 <= val <= 50:
+        if val < 2 or val > 50:
             return await ctx.reply("❌ Valeur entre 2 et 50.")
         am_cfg["spam_threshold"] = val
         save_config()
-        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Seuil spam : **{val}** messages."))
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Seuil spam défini sur **{val}** messages."))
 
     # ── SPAM_INTERVAL ─────────────────────────────────────────────────────
     elif sc == "spam_interval":
         if not args or not args[0].isdigit():
             return await ctx.reply("❌ Usage : `+automod spam_interval <secondes>`")
         val = int(args[0])
-        if not 1 <= val <= 60:
-            return await ctx.reply("❌ Valeur entre 1 et 60.")
+        if val < 1 or val > 60:
+            return await ctx.reply("❌ Valeur entre 1 et 60 secondes.")
         am_cfg["spam_interval"] = val
         save_config()
-        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Intervalle spam : **{val}s**."))
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Intervalle spam défini sur **{val}s**."))
 
     # ── CAPS_PERCENT ──────────────────────────────────────────────────────
     elif sc == "caps_percent":
         if not args or not args[0].isdigit():
             return await ctx.reply("❌ Usage : `+automod caps_percent <nombre>` (ex : 70)")
         val = int(args[0])
-        if not 10 <= val <= 100:
+        if val < 10 or val > 100:
             return await ctx.reply("❌ Valeur entre 10 et 100.")
         am_cfg["caps_percent"] = val
         save_config()
-        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Seuil majuscules : **{val}%**."))
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Seuil majuscules défini sur **{val}%**."))
 
     # ── MAX_MENTIONS ──────────────────────────────────────────────────────
     elif sc == "max_mentions":
         if not args or not args[0].isdigit():
             return await ctx.reply("❌ Usage : `+automod max_mentions <nombre>`")
         val = int(args[0])
-        if not 1 <= val <= 50:
+        if val < 1 or val > 50:
             return await ctx.reply("❌ Valeur entre 1 et 50.")
         am_cfg["max_mentions"] = val
         save_config()
-        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Nb max mentions : **{val}**."))
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Nb max mentions défini sur **{val}**."))
 
     # ── FLOOD_COUNT ───────────────────────────────────────────────────────
     elif sc == "flood_count":
         if not args or not args[0].isdigit():
             return await ctx.reply("❌ Usage : `+automod flood_count <nombre>`")
         val = int(args[0])
-        if not 2 <= val <= 20:
+        if val < 2 or val > 20:
             return await ctx.reply("❌ Valeur entre 2 et 20.")
         am_cfg["flood_count"] = val
         save_config()
-        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Seuil flood : **{val}** messages identiques."))
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Seuil flood défini sur **{val}** messages identiques."))
 
     # ── BADWORD add/remove/list ───────────────────────────────────────────
     elif sc == "badword":
@@ -2303,25 +1738,30 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
             return await ctx.reply("❌ Usage : `+automod badword add/remove/list <mot>`")
         action = args[0].lower()
         badwords = am_cfg.setdefault("badwords", [])
+
         if action == "list":
             if not badwords:
                 return await ctx.reply("ℹ️ Aucun mot interdit configuré.")
-            return await ctx.send(embed=warning_embed("🚫 Mots interdits", "\n".join(f"`{w}`" for w in badwords)))
+            e = warning_embed("🚫 Mots interdits", "\n".join(f"`{w}`" for w in badwords))
+            return await ctx.send(embed=e)
+
         if len(args) < 2:
             return await ctx.reply(f"❌ Usage : `+automod badword {action} <mot>`")
         word = args[1].lower()
+
         if action == "add":
             if word in badwords:
                 return await ctx.reply(f"❌ `{word}` est déjà dans la liste.")
             badwords.append(word)
             save_config()
-            await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Mot `{word}` ajouté."))
+            await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Mot `{word}` ajouté à la liste des mots interdits."))
+
         elif action == "remove":
             if word not in badwords:
                 return await ctx.reply(f"❌ `{word}` n'est pas dans la liste.")
             badwords.remove(word)
             save_config()
-            await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Mot `{word}` retiré."))
+            await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Mot `{word}` retiré de la liste des mots interdits."))
         else:
             await ctx.reply("❌ Action invalide. Utilise `add`, `remove` ou `list`.")
 
@@ -2386,13 +1826,14 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
 # ─────────────────────────────────────────
 #  Lancement avec reconnexion automatique
 # ─────────────────────────────────────────
+
 if __name__ == "__main__":
     if not TOKEN:
         log.error("❌ DISCORD_TOKEN manquant ! Vérifie tes variables d'environnement.")
         exit(1)
 
-    RETRY_DELAY = 5
-    MAX_RETRIES = 10
+    RETRY_DELAY = 5   # secondes entre chaque tentative
+    MAX_RETRIES = 10  # nb max de tentatives consécutives
     attempts = 0
 
     while True:
@@ -2400,8 +1841,8 @@ if __name__ == "__main__":
             log.info(f"🚀 Démarrage du bot (tentative {attempts + 1})...")
             bot.run(TOKEN, log_handler=None)
         except discord.errors.LoginFailure:
-            log.error("❌ Token Discord invalide.")
-            break
+            log.error("❌ Token Discord invalide. Vérification requise.")
+            break  # Inutile de réessayer avec un mauvais token
         except (discord.errors.ConnectionClosed,
                 discord.errors.GatewayNotFound,
                 discord.errors.HTTPException) as e:
@@ -2421,5 +1862,5 @@ if __name__ == "__main__":
 
         time.sleep(RETRY_DELAY)
 
-        # Recréer le bot pour éviter des états corrompus
+        # Recréer le bot pour éviter des états corrompus après certaines erreurs
         bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
