@@ -32,7 +32,7 @@ except ImportError:
 # CONFIGURATION  ← Modifie ici
 # ══════════════════════════════════════════════════════════════════
 PREFIX   = '+'
-TOKEN    = os.getenv('BOT_TOKEN', 'VOTRE_TOKEN_ICI')
+TOKEN = os.getenv('DISCORD_TOKEN', '')
 DATA_DIR = 'data'
 
 # ══════════════════════════════════════════════════════════════════
