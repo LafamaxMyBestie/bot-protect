@@ -362,7 +362,7 @@ async def on_ready():
         if not task.is_running():
             task.start()
     await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.watching, name=f"{PREFIX}pluvshiie lpb omgmgmgmg marie moi stppp"))
+        type=discord.ActivityType.watching, name=f"pluvshiie lpb omgmgmg marie moi stppp"))
 
 @bot.event
 async def on_command(ctx):
