@@ -2148,135 +2148,772 @@ async def check_temproles():
         save_temproles()
 
 # ─────────────────────────────────────────
-#  SYSTÈME DE TICKETS
+#  SYSTÈME DE TICKETS — par boutons, personnalisable
 # ─────────────────────────────────────────
-@bot.command()
-async def ticket(ctx):
-    """Ouvrir un ticket de support."""
-    cfg = get_guild_cfg(ctx.guild.id)
-    cat_id = cfg.get("ticket_category")
-    staff_role_id = cfg.get("ticket_staff_role")
+TICKET_SETTINGS_DEFAULTS = {
+    "max_per_user":  1,                 # nb de tickets ouverts simultanément autorisés / membre
+    "confirm_close": True,              # demander confirmation avant fermeture
+    "ping_staff":    True,              # ping le(s) rôle(s) staff à l'ouverture
+    "naming":        "ticket-{user}",   # motif du nom de salon : {user} {type} {number}
+    "log_channel":   None,              # salon où sont envoyés les transcripts (sinon fallback +setlog)
+    "next_number":   0,                 # compteur auto-incrémenté pour {number}
+}
 
-    # Vérifier si le membre a déjà un ticket ouvert
-    gid = str(ctx.guild.id)
-    uid = str(ctx.author.id)
-    existing = tickets_db.get(gid, {}).get(uid)
-    if existing:
-        ch = ctx.guild.get_channel(int(existing.get("channel_id", 0)))
-        if ch:
-            return await ctx.reply(f"❌ Tu as déjà un ticket ouvert : {ch.mention}")
-        else:
-            tickets_db[gid].pop(uid, None)
+BUTTON_STYLES = {
+    "primary":   discord.ButtonStyle.primary,
+    "secondary": discord.ButtonStyle.secondary,
+    "success":   discord.ButtonStyle.success,
+    "danger":    discord.ButtonStyle.danger,
+}
 
-    category = ctx.guild.get_channel(int(cat_id)) if cat_id else None
+def get_ticket_cfg(guild_id) -> dict:
+    """Retourne (et initialise si besoin) la config tickets d'un serveur, avec migration
+    automatique depuis l'ancien système (+setticket / +setstaffrole)."""
+    gid = str(guild_id)
+    tcfg = tickets_db.setdefault(gid, {})
+    tcfg.setdefault("settings", {})
+    tcfg.setdefault("types", {})
+    tcfg.setdefault("panels", {})
+    tcfg.setdefault("open", {})
+    for k, v in TICKET_SETTINGS_DEFAULTS.items():
+        tcfg["settings"].setdefault(k, v)
+
+    if not tcfg.get("_migrated"):
+        old_cfg = config_db.get(gid, {})
+        old_cat  = old_cfg.get("ticket_category")
+        old_role = old_cfg.get("ticket_staff_role")
+        if (old_cat or old_role) and not tcfg["types"]:
+            tcfg["types"]["support"] = {
+                "label":           "Support",
+                "emoji":           "🎫",
+                "style":           "primary",
+                "category_id":     str(old_cat) if old_cat else None,
+                "staff_roles":     [str(old_role)] if old_role else [],
+                "welcome_message": None,
+                "questions":       [],
+            }
+        tcfg["_migrated"] = True
+        save_tickets()
+    return tcfg
+
+def slugify(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"[^a-z0-9\-_]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text[:40]
+
+def sanitize_channel_name(name: str) -> str:
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9\-_]+", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name[:90] or "ticket"
+
+def is_ticket_staff(member: discord.Member, ttype: dict) -> bool:
+    """Un membre est considéré staff d'un type de ticket s'il a manage_guild/manage_channels/admin,
+    ou s'il possède l'un des rôles staff définis sur ce type."""
+    perms = member.guild_permissions
+    if perms.administrator or perms.manage_channels or perms.manage_guild:
+        return True
+    member_role_ids = {str(r.id) for r in member.roles}
+    return bool(member_role_ids & set(ttype.get("staff_roles", [])))
+
+def get_open_ticket(guild_id, channel_id):
+    """Retourne (tdata, ttype) si le salon donné est un ticket actif, sinon (None, None)."""
+    tcfg = get_ticket_cfg(guild_id)
+    tdata = tcfg["open"].get(str(channel_id))
+    if not tdata:
+        return None, None
+    ttype = tcfg["types"].get(tdata.get("type_id"), {})
+    return tdata, ttype
+
+def build_panel_view(gid: str, type_ids: list) -> discord.ui.View:
+    """Construit la vue (boutons d'ouverture) à partir des types de tickets actuels."""
+    tcfg = get_ticket_cfg(gid)
+    view = discord.ui.View(timeout=None)
+    for tid in type_ids:
+        t = tcfg["types"].get(tid)
+        if not t:
+            continue
+        style = BUTTON_STYLES.get(t.get("style", "primary"), discord.ButtonStyle.primary)
+        try:
+            view.add_item(TicketOpenButton(tid, t.get("label", tid)[:80], t.get("emoji") or None, style))
+        except Exception:
+            # emoji invalide par ex. : on retente sans emoji plutôt que de casser tout le panneau
+            view.add_item(TicketOpenButton(tid, t.get("label", tid)[:80], None, style))
+    return view
+
+async def refresh_panels(guild: discord.Guild):
+    """Met à jour tous les panneaux existants d'un serveur (boutons supprimés/édités) et nettoie
+    les panneaux dont le salon/message n'existe plus."""
+    gid = str(guild.id)
+    tcfg = get_ticket_cfg(gid)
+    changed = False
+    for msg_id, panel in list(tcfg["panels"].items()):
+        channel = guild.get_channel(int(panel["channel_id"]))
+        if not channel:
+            tcfg["panels"].pop(msg_id, None)
+            changed = True
+            continue
+        try:
+            message = await channel.fetch_message(int(msg_id))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            tcfg["panels"].pop(msg_id, None)
+            changed = True
+            continue
+        type_ids = [tid for tid in panel.get("type_ids", []) if tid in tcfg["types"]]
+        if type_ids != panel.get("type_ids"):
+            panel["type_ids"] = type_ids
+            changed = True
+        view = build_panel_view(gid, type_ids)
+        try:
+            await message.edit(view=view)
+            bot.add_view(view, message_id=message.id)
+        except Exception:
+            pass
+    if changed:
+        save_tickets()
+
+def register_ticket_views():
+    """Réenregistre toutes les vues persistantes (boutons) au démarrage du bot, pour qu'elles
+    fonctionnent même après un redémarrage."""
+    try:
+        bot.add_view(TicketManageView())
+    except Exception:
+        pass
+    for gid, tcfg in tickets_db.items():
+        for msg_id, panel in tcfg.get("panels", {}).items():
+            type_ids = [t for t in panel.get("type_ids", []) if t in tcfg.get("types", {})]
+            if not type_ids:
+                continue
+            try:
+                view = build_panel_view(gid, type_ids)
+                bot.add_view(view, message_id=int(msg_id))
+            except Exception:
+                pass
+
+async def close_ticket_channel(channel: discord.TextChannel, closer: discord.abc.User):
+    """Logique partagée de fermeture : transcript, log, suppression du salon."""
+    guild = channel.guild
+    gid = str(guild.id)
+    tcfg = get_ticket_cfg(gid)
+    tdata = tcfg["open"].pop(str(channel.id), None)
+    save_tickets()
+    if tdata is None:
+        return
+
+    ttype = tcfg["types"].get(tdata.get("type_id"), {})
+    owner = guild.get_member(int(tdata["owner_id"])) if tdata.get("owner_id") else None
+
+    transcript_lines = []
+    try:
+        async for msg in channel.history(limit=500, oldest_first=True):
+            ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
+            content = msg.content or "[sans texte]"
+            if msg.attachments:
+                content += " " + " ".join(a.url for a in msg.attachments)
+            transcript_lines.append(f"[{ts}] {msg.author} : {content}")
+    except Exception:
+        pass
+    transcript_bytes = "\n".join(transcript_lines).encode("utf-8")
+
+    log_ch_id = tcfg["settings"].get("log_channel") or get_guild_cfg(guild.id).get("log_channel")
+    if log_ch_id:
+        log_ch = guild.get_channel(int(log_ch_id))
+        if log_ch:
+            claimer = guild.get_member(int(tdata["claimed_by"])) if tdata.get("claimed_by") else None
+            e = info_embed(
+                "🎫 Ticket fermé",
+                f"**Salon :** {channel.name}\n"
+                f"**Type :** {ttype.get('label', '?')}\n"
+                f"**Propriétaire :** {owner.mention if owner else tdata.get('owner_id', '?')}\n"
+                f"**Fermé par :** {closer.mention}\n"
+                f"**Réclamé par :** {claimer.mention if claimer else 'Personne'}"
+            )
+            try:
+                await log_ch.send(
+                    embed=e,
+                    file=discord.File(BytesIO(transcript_bytes), filename=f"transcript-{channel.name}.txt")
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    try:
+        await channel.send(embed=info_embed("🎫 Ticket fermé", f"Fermé par {closer.mention}. Ce salon sera supprimé dans 5 secondes."))
+    except Exception:
+        pass
+    await asyncio.sleep(5)
+    try:
+        await channel.delete(reason=f"Ticket fermé par {closer}")
+    except discord.Forbidden:
+        pass
+
+# ── Composants UI ─────────────────────────────────────────────────────────
+
+class TicketOpenButton(discord.ui.Button):
+    def __init__(self, type_id: str, label: str, emoji, style: discord.ButtonStyle):
+        super().__init__(label=label, emoji=emoji, style=style, custom_id=f"ticket_open:{type_id}")
+        self.type_id = type_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await handle_ticket_button(interaction, self.type_id)
+
+class TicketOpenModal(discord.ui.Modal):
+    def __init__(self, type_id: str, questions: list):
+        ttype_label = "Nouveau ticket"
+        super().__init__(title=ttype_label[:45])
+        self.type_id = type_id
+        self.answer_inputs = []
+        for q in questions[:5]:
+            ti = discord.ui.TextInput(
+                label=q["label"][:45],
+                style=discord.TextStyle.paragraph if q.get("style") == "long" else discord.TextStyle.short,
+                required=q.get("required", True),
+                max_length=1000 if q.get("style") == "long" else 200,
+            )
+            self.add_item(ti)
+            self.answer_inputs.append((q["label"], ti))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        answers = [(label, ti.value) for label, ti in self.answer_inputs]
+        await create_ticket_channel(interaction, self.type_id, answers)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.error(f"Erreur dans TicketOpenModal : {error}")
+        try:
+            await interaction.response.send_message("❌ Une erreur est survenue lors de la création du ticket.", ephemeral=True)
+        except discord.InteractionResponded:
+            await interaction.followup.send("❌ Une erreur est survenue lors de la création du ticket.", ephemeral=True)
+
+class TicketMemberModal(discord.ui.Modal):
+    def __init__(self, action: str):
+        super().__init__(title="Ajouter un membre" if action == "add" else "Retirer un membre")
+        self.action = action
+        self.member_input = discord.ui.TextInput(
+            label="ID ou nom du membre",
+            placeholder="Ex : 123456789012345678 ou Pseudo",
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.member_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.member_input.value.strip().strip("<@!>")
+        member = None
+        if raw.isdigit():
+            member = interaction.guild.get_member(int(raw))
+        if not member:
+            member = discord.utils.find(
+                lambda m: m.name.lower() == raw.lower() or (m.nick or "").lower() == raw.lower() or str(m.display_name).lower() == raw.lower(),
+                interaction.guild.members
+            )
+        if not member:
+            return await interaction.response.send_message("❌ Membre introuvable. Utilise un ID valide ou un nom exact.", ephemeral=True)
+
+        tdata, _ = get_open_ticket(interaction.guild.id, interaction.channel.id)
+        if tdata is None:
+            return await interaction.response.send_message("❌ Ce salon n'est plus un ticket actif.", ephemeral=True)
+
+        try:
+            if self.action == "add":
+                await interaction.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
+                added = tdata.setdefault("added_members", [])
+                if str(member.id) not in added:
+                    added.append(str(member.id))
+                save_tickets()
+                await interaction.response.send_message(embed=success_embed("➕ Membre ajouté", f"{member.mention} a été ajouté à ce ticket par {interaction.user.mention}."))
+            else:
+                await interaction.channel.set_permissions(member, overwrite=None)
+                added = tdata.get("added_members", [])
+                if str(member.id) in added:
+                    added.remove(str(member.id))
+                save_tickets()
+                await interaction.response.send_message(embed=success_embed("➖ Membre retiré", f"{member.mention} a été retiré de ce ticket par {interaction.user.mention}."))
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Permissions insuffisantes pour modifier ce salon.", ephemeral=True)
+
+class TicketCloseConfirmView(discord.ui.View):
+    def __init__(self, requester: discord.abc.User):
+        super().__init__(timeout=60)
+        self.requester = requester
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(label="Confirmer", style=discord.ButtonStyle.danger, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester.id:
+            return await interaction.response.send_message("❌ Seule la personne ayant initié la fermeture peut confirmer.", ephemeral=True)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="🔒 Fermeture en cours...", view=self)
+        await close_ticket_channel(interaction.channel, interaction.user)
+
+    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester.id:
+            return await interaction.response.send_message("❌ Seule la personne ayant initié la fermeture peut annuler.", ephemeral=True)
+        await interaction.response.edit_message(content="❌ Fermeture annulée.", view=None)
+
+class TicketManageView(discord.ui.View):
+    """Vue persistante envoyée dans chaque salon de ticket (Réclamer / Ajouter / Retirer / Fermer)."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Réclamer", emoji="🙋", style=discord.ButtonStyle.secondary, custom_id="ticket_claim")
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        tdata, ttype = get_open_ticket(interaction.guild.id, interaction.channel.id)
+        if tdata is None:
+            return await interaction.response.send_message("❌ Ce salon n'est pas un ticket actif.", ephemeral=True)
+        if not is_ticket_staff(interaction.user, ttype):
+            return await interaction.response.send_message("❌ Tu n'as pas la permission de réclamer ce ticket.", ephemeral=True)
+        if tdata.get("claimed_by"):
+            claimer = interaction.guild.get_member(int(tdata["claimed_by"]))
+            return await interaction.response.send_message(f"❌ Déjà réclamé par {claimer.mention if claimer else 'un membre du staff'}.", ephemeral=True)
+        tdata["claimed_by"] = str(interaction.user.id)
+        save_tickets()
+        await interaction.response.send_message(embed=success_embed("🙋 Ticket réclamé", f"{interaction.user.mention} prend en charge ce ticket."))
+
+    @discord.ui.button(label="Ajouter", emoji="➕", style=discord.ButtonStyle.secondary, custom_id="ticket_add_member")
+    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        tdata, ttype = get_open_ticket(interaction.guild.id, interaction.channel.id)
+        if tdata is None:
+            return await interaction.response.send_message("❌ Ce salon n'est pas un ticket actif.", ephemeral=True)
+        if not is_ticket_staff(interaction.user, ttype):
+            return await interaction.response.send_message("❌ Tu n'as pas la permission d'ajouter un membre.", ephemeral=True)
+        await interaction.response.send_modal(TicketMemberModal("add"))
+
+    @discord.ui.button(label="Retirer", emoji="➖", style=discord.ButtonStyle.secondary, custom_id="ticket_remove_member")
+    async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        tdata, ttype = get_open_ticket(interaction.guild.id, interaction.channel.id)
+        if tdata is None:
+            return await interaction.response.send_message("❌ Ce salon n'est pas un ticket actif.", ephemeral=True)
+        if not is_ticket_staff(interaction.user, ttype):
+            return await interaction.response.send_message("❌ Tu n'as pas la permission de retirer un membre.", ephemeral=True)
+        await interaction.response.send_modal(TicketMemberModal("remove"))
+
+    @discord.ui.button(label="Fermer", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="ticket_close")
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        tdata, ttype = get_open_ticket(interaction.guild.id, interaction.channel.id)
+        if tdata is None:
+            return await interaction.response.send_message("❌ Ce salon n'est pas un ticket actif.", ephemeral=True)
+        is_owner = str(interaction.user.id) == tdata.get("owner_id")
+        if not (is_owner or is_ticket_staff(interaction.user, ttype)):
+            return await interaction.response.send_message("❌ Tu n'es pas autorisé à fermer ce ticket.", ephemeral=True)
+
+        tcfg = get_ticket_cfg(interaction.guild.id)
+        if not tcfg["settings"].get("confirm_close", True):
+            await interaction.response.send_message("🔒 Fermeture du ticket en cours...", ephemeral=True)
+            return await close_ticket_channel(interaction.channel, interaction.user)
+
+        view = TicketCloseConfirmView(interaction.user)
+        await interaction.response.send_message("⚠️ Confirmer la fermeture de ce ticket ?", view=view, ephemeral=True)
+
+# ── Ouverture d'un ticket ───────────────────────────────────────────────────
+
+async def handle_ticket_button(interaction: discord.Interaction, type_id: str):
+    gid = str(interaction.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    ttype = tcfg["types"].get(type_id)
+    if not ttype:
+        return await interaction.response.send_message("❌ Ce type de ticket n'est plus disponible. Préviens un administrateur.", ephemeral=True)
+
+    uid = str(interaction.user.id)
+    settings = tcfg["settings"]
+    max_per_user = settings.get("max_per_user", 1)
+    open_count = sum(1 for t in tcfg["open"].values() if t.get("owner_id") == uid)
+    if open_count >= max_per_user:
+        word = "un ticket" if max_per_user == 1 else f"{max_per_user} tickets"
+        return await interaction.response.send_message(f"❌ Tu as déjà {word} ouvert(s). Ferme-le avant d'en ouvrir un nouveau.", ephemeral=True)
+
+    questions = ttype.get("questions", [])
+    if questions:
+        return await interaction.response.send_modal(TicketOpenModal(type_id, questions))
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await create_ticket_channel(interaction, type_id, answers=None)
+
+async def create_ticket_channel(interaction: discord.Interaction, type_id: str, answers=None):
+    """Crée réellement le salon de ticket. Suppose que l'interaction a déjà reçu une réponse
+    (defer) et utilise donc interaction.followup pour les messages de retour."""
+    guild = interaction.guild
+    member = interaction.user
+    gid = str(guild.id)
+    tcfg = get_ticket_cfg(gid)
+    ttype = tcfg["types"].get(type_id)
+    if not ttype:
+        return await interaction.followup.send("❌ Ce type de ticket n'est plus disponible.", ephemeral=True)
+
+    settings = tcfg["settings"]
+    uid = str(member.id)
+
+    # Double vérification de la limite (entre l'ouverture du modal et sa soumission, la situation peut changer)
+    max_per_user = settings.get("max_per_user", 1)
+    open_count = sum(1 for t in tcfg["open"].values() if t.get("owner_id") == uid)
+    if open_count >= max_per_user:
+        word = "un ticket" if max_per_user == 1 else f"{max_per_user} tickets"
+        return await interaction.followup.send(f"❌ Tu as déjà {word} ouvert(s).", ephemeral=True)
+
+    category = guild.get_channel(int(ttype["category_id"])) if ttype.get("category_id") else None
+    if category and not isinstance(category, discord.CategoryChannel):
+        category = None
 
     overwrites = {
-        ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        ctx.author:             discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
-        ctx.guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_permissions=True),
     }
-    if staff_role_id:
-        staff_role = ctx.guild.get_role(int(staff_role_id))
-        if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    role_mentions = []
+    for rid in ttype.get("staff_roles", []):
+        role = guild.get_role(int(rid))
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            role_mentions.append(role.mention)
 
-    ticket_ch = await ctx.guild.create_text_channel(
-        f"ticket-{ctx.author.name}",
-        category=category,
-        overwrites=overwrites,
-        reason=f"Ticket ouvert par {ctx.author}"
-    )
+    settings["next_number"] = settings.get("next_number", 0) + 1
+    number = settings["next_number"]
 
-    tickets_db.setdefault(gid, {})[uid] = {
-        "channel_id": str(ticket_ch.id),
-        "opened_at": datetime.now(timezone.utc).isoformat(),
+    naming = settings.get("naming", "ticket-{user}")
+    base_name = naming.replace("{user}", member.name).replace("{type}", ttype.get("label", type_id)).replace("{number}", str(number))
+    base_name = sanitize_channel_name(base_name)
+
+    try:
+        channel = await guild.create_text_channel(
+            base_name,
+            category=category,
+            overwrites=overwrites,
+            reason=f"Ticket ({ttype.get('label', type_id)}) ouvert par {member}"
+        )
+    except discord.Forbidden:
+        save_tickets()
+        return await interaction.followup.send("❌ Je n'ai pas la permission de créer un salon. Préviens un administrateur.", ephemeral=True)
+
+    tcfg["open"][str(channel.id)] = {
+        "owner_id":       uid,
+        "type_id":        type_id,
+        "opened_at":      datetime.now(timezone.utc).isoformat(),
+        "claimed_by":      None,
+        "added_members":  [],
+        "number":         number,
     }
     save_tickets()
 
+    welcome = ttype.get("welcome_message") or "Décris ta demande ci-dessous, le staff va te répondre rapidement."
+    welcome = welcome.replace("{user}", member.mention).replace("{type}", ttype.get("label", type_id))
+
     e = discord.Embed(
-        title="🎫 Ticket de support",
-        description=(
-            f"Bienvenue {ctx.author.mention} !\n\n"
-            f"Décris ton problème ou ta demande ci-dessous et le staff te répondra.\n"
-            f"Pour fermer ce ticket : `{PREFIX}closeticket`"
-        ),
-        color=discord.Color.blurple(),
+        title=f"{ttype.get('emoji', '🎫')} {ttype.get('label', type_id)} — Ticket #{number}",
+        description=welcome,
+        color=discord.Color.purple(),
         timestamp=datetime.now(timezone.utc)
     )
-    e.set_footer(text=f"Ticket de {ctx.author}", icon_url=ctx.author.display_avatar.url)
-    await ticket_ch.send(embed=e)
-    if staff_role_id:
-        staff_role = ctx.guild.get_role(int(staff_role_id))
-        if staff_role:
-            await ticket_ch.send(f"{staff_role.mention} — Nouveau ticket !", delete_after=5)
+    if answers:
+        for label, value in answers:
+            if value:
+                e.add_field(name=label[:256], value=value[:1024], inline=False)
+    e.set_footer(text=f"Ouvert par {member}", icon_url=member.display_avatar.url)
 
-    await ctx.reply(f"✅ Ton ticket a été créé : {ticket_ch.mention}")
+    content = " ".join(role_mentions) if (role_mentions and settings.get("ping_staff", True)) else None
+    try:
+        await channel.send(content=content, embed=e, view=TicketManageView())
+    except Exception:
+        pass
+
+    await interaction.followup.send(f"✅ Ton ticket a été créé : {channel.mention}", ephemeral=True)
+
+# ── Commandes d'administration ──────────────────────────────────────────────
+
+@bot.command(name="ticketadd")
+@commands.has_permissions(manage_guild=True)
+async def ticketadd(ctx, *, nom: str):
+    """Créer un nouveau type de ticket (= un bouton). Usage : +ticketadd <nom>"""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    type_id = slugify(nom)
+    if not type_id:
+        return await ctx.reply("❌ Nom invalide.")
+    if type_id in tcfg["types"]:
+        return await ctx.reply(f"❌ Un type `{type_id}` existe déjà.")
+    if len(tcfg["types"]) >= 23:
+        return await ctx.reply("❌ Limite de 23 types de tickets atteinte (max 25 boutons par panneau).")
+
+    tcfg["types"][type_id] = {
+        "label":           nom[:80],
+        "emoji":           "🎫",
+        "style":           "primary",
+        "category_id":     None,
+        "staff_roles":     [],
+        "welcome_message": None,
+        "questions":       [],
+    }
+    save_tickets()
+    await ctx.reply(embed=success_embed(
+        "🎫 Type de ticket créé",
+        f"Identifiant : `{type_id}`\n\n"
+        f"Configure-le avec :\n"
+        f"`{PREFIX}ticketedit {type_id} category <catégorie>`\n"
+        f"`{PREFIX}ticketrole {type_id} add @rôle`\n"
+        f"`{PREFIX}ticketedit {type_id} emoji <emoji>`\n"
+        f"Puis envoie le panneau avec `{PREFIX}ticketpanel #salon Titre | Description`."
+    ))
+    await refresh_panels(ctx.guild)
+
+@bot.command(name="ticketremove")
+@commands.has_permissions(manage_guild=True)
+async def ticketremove(ctx, type_id: str):
+    """Supprimer un type de ticket. Usage : +ticketremove <type>"""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    type_id = type_id.lower()
+    if type_id not in tcfg["types"]:
+        return await ctx.reply(f"❌ Type `{type_id}` introuvable. Utilise `{PREFIX}tickettypes`.")
+    label = tcfg["types"][type_id]["label"]
+    del tcfg["types"][type_id]
+    save_tickets()
+    await ctx.reply(embed=success_embed("🗑️ Type supprimé", f"Le type **{label}** (`{type_id}`) a été supprimé. Les panneaux existants sont mis à jour."))
+    await refresh_panels(ctx.guild)
+
+@bot.command(name="ticketedit")
+@commands.has_permissions(manage_guild=True)
+async def ticketedit(ctx, type_id: str, champ: str, *, valeur: str = None):
+    """Modifier un type de ticket. Usage : +ticketedit <type> <label|emoji|style|category|message> <valeur>"""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    type_id = type_id.lower()
+    ttype = tcfg["types"].get(type_id)
+    if not ttype:
+        return await ctx.reply(f"❌ Type `{type_id}` introuvable. Utilise `{PREFIX}tickettypes`.")
+    champ = champ.lower()
+
+    if champ == "label":
+        if not valeur:
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketedit {type_id} label <texte>`")
+        ttype["label"] = valeur[:80]
+        msg = f"Label mis à jour : **{valeur[:80]}**."
+    elif champ == "emoji":
+        if not valeur:
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketedit {type_id} emoji <emoji>`")
+        ttype["emoji"] = valeur.strip()[:50]
+        msg = f"Emoji mis à jour : {valeur.strip()}"
+    elif champ == "style":
+        if not valeur or valeur.lower() not in BUTTON_STYLES:
+            return await ctx.reply(f"❌ Style invalide. Choix possibles : {', '.join(BUTTON_STYLES)}")
+        ttype["style"] = valeur.lower()
+        msg = f"Style mis à jour : **{valeur.lower()}**."
+    elif champ == "category":
+        if not valeur:
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketedit {type_id} category <nom catégorie>`")
+        cat = discord.utils.get(ctx.guild.categories, name=valeur)
+        if not cat:
+            return await ctx.reply(f"❌ Catégorie `{valeur}` introuvable.")
+        ttype["category_id"] = str(cat.id)
+        msg = f"Catégorie mise à jour : **{cat.name}**."
+    elif champ == "message":
+        if not valeur:
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketedit {type_id} message <texte>` (variables : {{user}}, {{type}})")
+        ttype["welcome_message"] = valeur[:1500]
+        msg = "Message d'accueil mis à jour."
+    else:
+        return await ctx.reply("❌ Champ invalide. Choix : `label`, `emoji`, `style`, `category`, `message`.")
+
+    save_tickets()
+    await ctx.reply(embed=success_embed("🎫 Type modifié", msg))
+    await refresh_panels(ctx.guild)
+
+@bot.command(name="ticketrole")
+@commands.has_permissions(manage_guild=True)
+async def ticketrole(ctx, type_id: str, action: str, role: discord.Role):
+    """Gérer les rôles staff d'un type. Usage : +ticketrole <type> add/remove <@rôle>"""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    type_id = type_id.lower()
+    ttype = tcfg["types"].get(type_id)
+    if not ttype:
+        return await ctx.reply(f"❌ Type `{type_id}` introuvable. Utilise `{PREFIX}tickettypes`.")
+    roles = ttype.setdefault("staff_roles", [])
+    rid = str(role.id)
+    action = action.lower()
+    if action == "add":
+        if rid in roles:
+            return await ctx.reply(f"❌ {role.mention} est déjà rôle staff de ce type.")
+        roles.append(rid)
+        save_tickets()
+        await ctx.reply(embed=success_embed("🎫 Rôle ajouté", f"{role.mention} peut maintenant voir/gérer les tickets **{ttype['label']}**."))
+    elif action == "remove":
+        if rid not in roles:
+            return await ctx.reply(f"❌ {role.mention} n'est pas rôle staff de ce type.")
+        roles.remove(rid)
+        save_tickets()
+        await ctx.reply(embed=success_embed("🎫 Rôle retiré", f"{role.mention} retiré des rôles staff de **{ttype['label']}**."))
+    else:
+        await ctx.reply("❌ Action invalide. Utilise `add` ou `remove`.")
+
+@bot.command(name="ticketquestion")
+@commands.has_permissions(manage_guild=True)
+async def ticketquestion(ctx, type_id: str, action: str, *, valeur: str = None):
+    """Gérer les questions du formulaire (modal) d'un type.
+    Usage : +ticketquestion <type> add/addlong/remove/list [intitulé|numéro]"""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    type_id = type_id.lower()
+    ttype = tcfg["types"].get(type_id)
+    if not ttype:
+        return await ctx.reply(f"❌ Type `{type_id}` introuvable. Utilise `{PREFIX}tickettypes`.")
+    questions = ttype.setdefault("questions", [])
+    action = action.lower()
+
+    if action in ("add", "addlong"):
+        if not valeur:
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketquestion {type_id} {action} <intitulé de la question>`")
+        if len(questions) >= 5:
+            return await ctx.reply("❌ Limite de 5 questions par type (limite Discord pour un formulaire).")
+        questions.append({"label": valeur[:45], "style": "long" if action == "addlong" else "short", "required": True})
+        save_tickets()
+        await ctx.reply(embed=success_embed("🎫 Question ajoutée", f"« {valeur[:45]} » ajoutée au formulaire de **{ttype['label']}**."))
+    elif action == "remove":
+        if not valeur or not valeur.isdigit():
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketquestion {type_id} remove <numéro>` (voir `list`)")
+        idx = int(valeur) - 1
+        if not (0 <= idx < len(questions)):
+            return await ctx.reply("❌ Numéro invalide.")
+        removed = questions.pop(idx)
+        save_tickets()
+        await ctx.reply(embed=success_embed("🎫 Question supprimée", f"« {removed['label']} » supprimée."))
+    elif action == "list":
+        if not questions:
+            return await ctx.reply("ℹ️ Aucune question configurée pour ce type.")
+        lines = [f"**{i + 1}.** {q['label']} *({'long' if q['style'] == 'long' else 'court'})*" for i, q in enumerate(questions)]
+        return await ctx.send(embed=info_embed(f"🎫 Questions — {ttype['label']}", "\n".join(lines)))
+    else:
+        return await ctx.reply("❌ Action invalide. Utilise `add`, `addlong`, `remove` ou `list`.")
+
+@bot.command(name="tickettypes")
+@commands.has_permissions(manage_guild=True)
+async def tickettypes(ctx):
+    """Lister les types de tickets configurés."""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    if not tcfg["types"]:
+        return await ctx.reply(f"ℹ️ Aucun type de ticket configuré. Crée-en un avec `{PREFIX}ticketadd <nom>`.")
+    e = discord.Embed(title="🎫 Types de tickets configurés", color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
+    for tid, t in tcfg["types"].items():
+        cat = ctx.guild.get_channel(int(t["category_id"])) if t.get("category_id") else None
+        roles = [ctx.guild.get_role(int(r)) for r in t.get("staff_roles", [])]
+        roles = [r.mention for r in roles if r]
+        e.add_field(
+            name=f"{t.get('emoji', '🎫')} {t['label']}  (`{tid}`)",
+            value=(
+                f"Style : `{t.get('style', 'primary')}`\n"
+                f"Catégorie : {cat.mention if cat else '*non définie*'}\n"
+                f"Rôles staff : {', '.join(roles) if roles else '*aucun*'}\n"
+                f"Questions formulaire : {len(t.get('questions', []))}"
+            ),
+            inline=False
+        )
+    await ctx.send(embed=e)
+
+@bot.command(name="ticketpanel")
+@commands.has_permissions(manage_guild=True)
+async def ticketpanel(ctx, channel: discord.TextChannel, *, contenu: str = None):
+    """Envoyer le panneau de tickets (boutons). Usage : +ticketpanel #salon Titre | Description"""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    if not tcfg["types"]:
+        return await ctx.reply(f"❌ Aucun type de ticket configuré. Crée-en un avec `{PREFIX}ticketadd <nom>` avant d'envoyer un panneau.")
+
+    if contenu:
+        parts = contenu.split("|", 1)
+        titre = parts[0].strip() or "🎫 Support"
+        description = parts[1].strip() if len(parts) > 1 else "Clique sur un bouton ci-dessous pour ouvrir un ticket."
+    else:
+        titre = "🎫 Support"
+        description = "Clique sur un bouton ci-dessous pour ouvrir un ticket."
+
+    type_ids = list(tcfg["types"].keys())[:25]
+    e = discord.Embed(title=titre, description=description, color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
+    e.set_footer(text=f"Panneau créé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
+
+    view = build_panel_view(gid, type_ids)
+    try:
+        msg = await channel.send(embed=e, view=view)
+    except discord.Forbidden:
+        return await ctx.reply(f"❌ Je n'ai pas la permission d'envoyer de message dans {channel.mention}.")
+
+    tcfg["panels"][str(msg.id)] = {
+        "channel_id": str(channel.id),
+        "title":      titre,
+        "description": description,
+        "type_ids":   type_ids,
+    }
+    save_tickets()
+    bot.add_view(view, message_id=msg.id)
+
+    await ctx.reply(embed=success_embed("🎫 Panneau envoyé", f"Le panneau de tickets a été envoyé dans {channel.mention} avec {len(type_ids)} bouton(s)."))
+
+@bot.command(name="ticketsettings")
+@commands.has_permissions(manage_guild=True)
+async def ticketsettings(ctx, option: str = None, *, valeur: str = None):
+    """Voir/modifier les réglages globaux des tickets.
+    Usage : +ticketsettings [max|logsalon|naming|confirmation|ping] [valeur]"""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    settings = tcfg["settings"]
+
+    if not option:
+        log_ch = ctx.guild.get_channel(int(settings["log_channel"])) if settings.get("log_channel") else None
+        e = discord.Embed(title="🎫 Paramètres des tickets", color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
+        e.add_field(name="Max tickets / membre", value=f"`{settings.get('max_per_user', 1)}`", inline=True)
+        e.add_field(name="Confirmation fermeture", value="🟢 ON" if settings.get("confirm_close", True) else "🔴 OFF", inline=True)
+        e.add_field(name="Ping staff à l'ouverture", value="🟢 ON" if settings.get("ping_staff", True) else "🔴 OFF", inline=True)
+        e.add_field(name="Salon de logs/transcripts", value=log_ch.mention if log_ch else "*celui défini par `+setlog`, sinon aucun*", inline=False)
+        e.add_field(name="Format des noms de salon", value=f"`{settings.get('naming', 'ticket-{user}')}`", inline=False)
+        e.set_footer(text=f"{PREFIX}ticketsettings <option> <valeur> pour modifier")
+        return await ctx.send(embed=e)
+
+    option = option.lower()
+    if option == "max":
+        if not valeur or not valeur.isdigit() or not (1 <= int(valeur) <= 10):
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketsettings max <1-10>`")
+        settings["max_per_user"] = int(valeur)
+        msg = f"Limite fixée à **{valeur}** ticket(s) par membre."
+    elif option == "logsalon":
+        match = re.search(r"\d{15,20}", valeur or "")
+        channel = ctx.guild.get_channel(int(match.group())) if match else None
+        if not channel:
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketsettings logsalon #salon`")
+        settings["log_channel"] = str(channel.id)
+        msg = f"Salon de logs des tickets : {channel.mention}."
+    elif option == "naming":
+        if not valeur:
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketsettings naming <motif>` (variables : {{user}}, {{type}}, {{number}})")
+        settings["naming"] = valeur[:90]
+        msg = f"Motif de nom de salon : `{valeur[:90]}`."
+    elif option == "confirmation":
+        if not valeur or valeur.lower() not in ("on", "off"):
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketsettings confirmation on/off`")
+        settings["confirm_close"] = (valeur.lower() == "on")
+        msg = f"Confirmation de fermeture : **{valeur.lower()}**."
+    elif option == "ping":
+        if not valeur or valeur.lower() not in ("on", "off"):
+            return await ctx.reply(f"❌ Usage : `{PREFIX}ticketsettings ping on/off`")
+        settings["ping_staff"] = (valeur.lower() == "on")
+        msg = f"Ping du staff à l'ouverture : **{valeur.lower()}**."
+    else:
+        return await ctx.reply("❌ Option invalide. Choix : `max`, `logsalon`, `naming`, `confirmation`, `ping`.")
+
+    save_tickets()
+    await ctx.reply(embed=success_embed("🎫 Paramètres", msg))
 
 @bot.command()
 @commands.has_permissions(manage_channels=True)
 async def closeticket(ctx):
-    """Fermer le ticket courant (dans le salon du ticket)."""
-    # Trouver à qui appartient ce ticket
-    gid = str(ctx.guild.id)
-    owner_uid = None
-    for uid, tdata in tickets_db.get(gid, {}).items():
-        if str(tdata.get("channel_id")) == str(ctx.channel.id):
-            owner_uid = uid
-            break
-    if not owner_uid:
+    """Fermer le ticket courant (alternative textuelle aux boutons)."""
+    tdata, _ = get_open_ticket(ctx.guild.id, ctx.channel.id)
+    if tdata is None:
         return await ctx.reply("❌ Ce salon n'est pas un ticket actif.")
-
-    # Générer un transcript simple
-    transcript_lines = []
-    async for msg in ctx.channel.history(limit=200, oldest_first=True):
-        ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
-        transcript_lines.append(f"[{ts}] {msg.author}: {msg.content}")
-    transcript_text = "\n".join(transcript_lines)
-    transcript_bytes = transcript_text.encode("utf-8")
-
-    # Envoyer le transcript dans le salon de logs
-    cfg = get_guild_cfg(ctx.guild.id)
-    log_ch_id = cfg.get("log_channel")
-    if log_ch_id:
-        log_ch = ctx.guild.get_channel(int(log_ch_id))
-        if log_ch:
-            owner_member = ctx.guild.get_member(int(owner_uid))
-            e = info_embed("🎫 Ticket fermé", f"**Ticket :** {ctx.channel.name}\n**Propriétaire :** {owner_member.mention if owner_member else owner_uid}\n**Fermé par :** {ctx.author.mention}")
-            await log_ch.send(
-                embed=e,
-                file=discord.File(BytesIO(transcript_bytes), filename=f"transcript-{ctx.channel.name}.txt")
-            )
-
-    tickets_db.get(gid, {}).pop(owner_uid, None)
-    save_tickets()
-    await ctx.send("🎫 Ticket fermé. Ce salon sera supprimé dans 5 secondes.")
-    await asyncio.sleep(5)
-    try:
-        await ctx.channel.delete(reason=f"Ticket fermé par {ctx.author}")
-    except discord.Forbidden:
-        pass
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setticket(ctx, *, categorie: str):
-    """Configurer la catégorie des tickets. Usage : +setticket <nom de catégorie>"""
-    cat = discord.utils.get(ctx.guild.categories, name=categorie)
-    if not cat:
-        return await ctx.reply(f"❌ Catégorie `{categorie}` introuvable.")
-    cfg = get_guild_cfg(ctx.guild.id)
-    cfg["ticket_category"] = str(cat.id)
-    save_config()
-    await ctx.reply(f"✅ Catégorie tickets définie sur **{cat.name}**.")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setstaffrole(ctx, role: discord.Role):
-    """Définir le rôle staff pour les tickets. Usage : +setstaffrole @rôle"""
-    cfg = get_guild_cfg(ctx.guild.id)
-    cfg["ticket_staff_role"] = str(role.id)
-    save_config()
-    await ctx.reply(f"✅ Rôle staff tickets défini sur {role.mention}.")
-
+    await close_ticket_channel(ctx.channel, ctx.author)
+    
 # ─────────────────────────────────────────
 #  SYSTÈME DE MARIAGE
 # ─────────────────────────────────────────
