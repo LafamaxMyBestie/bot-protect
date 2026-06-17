@@ -1207,13 +1207,18 @@ HELP_SECTIONS = {
     },
     "tickets": {
         "label": "🎫 Tickets",
-        "description": "Système de support par ticket",
+        "description": "Système de support par ticket (boutons)",
         "color": discord.Color.purple(),
         "commands": [
-            ("ticket",       "",               "Ouvrir un ticket de support"),
-            ("closeticket",  "",               "Fermer le ticket (dans le salon ticket)"),
-            ("setticket",    "<catégorie>",    "Configurer la catégorie des tickets"),
-            ("setstaffrole", "<rôle>",         "Définir le rôle staff des tickets"),
+            ("ticketadd",       "<nom>",                      "Créer un type de ticket (= un bouton)"),
+            ("ticketremove",    "<type>",                     "Supprimer un type de ticket"),
+            ("ticketedit",      "<type> <champ> <valeur>",     "Modifier label/emoji/style/catégorie/message"),
+            ("ticketrole",      "<type> add/remove <@rôle>",   "Gérer les rôles staff d'un type"),
+            ("ticketquestion",  "<type> add/remove/list",      "Gérer le formulaire d'ouverture"),
+            ("tickettypes",     "",                            "Lister les types configurés"),
+            ("ticketpanel",     "<salon> [Titre | Description]","Envoyer le panneau de boutons"),
+            ("ticketsettings",  "[option] [valeur]",           "Réglages globaux (max, logs, naming…)"),
+            ("closeticket",     "",                            "Fermer le ticket (dans le salon ticket)"),
         ],
     },
     "fun": {
