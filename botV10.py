@@ -97,6 +97,7 @@ _bot_stats = {
 SNIPE_MAX_AGE     = timedelta(days=3)
 SNIPE_MAX_PER_USER = 25
 _start_time = datetime.now(timezone.utc)
+_startup_tasks_launched = False  # évite de relancer resume_tempbans/check_temproles à chaque reconnexion
 
 # ─────────────────────────────────────────
 #  Helpers
@@ -162,12 +163,18 @@ AUTOMOD_DEFAULTS = {
     "anti_badwords":     False,
     "anti_zalgo":        False,
     "anti_flood":        False,
-    "anti_scam":         False,   # NOUVEAU : détecte les liens de scam connus
+    "anti_scam":         False,   # détecte les liens de scam connus
+    "anti_emoji":        False,   # NOUVEAU : trop d'emojis dans un même message
+    "anti_attachments":  False,   # NOUVEAU : trop de pièces jointes dans un même message
+    "anti_newlines":     False,   # NOUVEAU : trop de retours à la ligne (spam vertical)
     "spam_threshold":    5,
     "spam_interval":     5,
     "caps_percent":      70,
     "caps_min_length":   10,
     "max_mentions":      5,
+    "max_emojis":        10,      # NOUVEAU : nb max d'emojis autorisés par message
+    "max_attachments":   5,       # NOUVEAU : nb max de pièces jointes par message
+    "max_newlines":      10,      # NOUVEAU : nb max de retours à la ligne par message
     "badwords":          [],
     "flood_count":       3,
     "action":            "delete",
@@ -175,11 +182,16 @@ AUTOMOD_DEFAULTS = {
     "exempt_roles":      [],
     "exempt_channels":   [],
     "log_automod":       True,
-    "warn_threshold":    0,       # NOUVEAU : nb warns avant action auto (0 = désactivé)
-    "warn_action":       "mute",  # NOUVEAU : action déclenchée au seuil
-    "warn_action_dur":   "1h",    # NOUVEAU : durée si l'action est mute/tempban
-    "whitelist_domains": [],      # NOUVEAU : domaines autorisés malgré anti_links
+    "warn_threshold":    0,       # nb warns avant action auto (0 = désactivé)
+    "warn_action":       "mute",  # action déclenchée au seuil
+    "warn_action_dur":   "1h",    # durée si l'action est mute/tempban
+    "whitelist_domains": [],      # domaines autorisés malgré anti_links
 }
+
+# Pattern de détection d'emojis (unicode + emojis custom Discord <:nom:id>)
+EMOJI_PATTERN = re.compile(
+    r"<a?:\w+:\d+>|[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]"
+)
 
 # Patterns scam connus
 SCAM_PATTERNS = [
@@ -248,7 +260,10 @@ async def automod_action(message: discord.Message, reason: str, am_cfg: dict):
         entry = {"reason": f"[AutoMod] {reason}", "date": datetime.now(timezone.utc).isoformat(), "mod": str(bot.user.id)}
         warns_db.setdefault(gid, {}).setdefault(uid, []).append(entry)
         save_warns()
-        # Vérifier le seuil de warns
+        count = len(warns_db[gid][uid])
+        # Paliers fixes : 3 warns = mute 1j, 5 warns = bl
+        await apply_warn_milestones(guild, member, count)
+        # Vérifier le seuil de warns configurable (optionnel, désactivé par défaut)
         await check_warn_threshold(guild, member, am_cfg)
 
     elif action == "mute":
@@ -338,6 +353,61 @@ async def check_warn_threshold(guild: discord.Guild, member: discord.Member, am_
     )
     await send_log(guild, e)
 
+async def apply_warn_milestones(guild: discord.Guild, member: discord.Member, count: int):
+    """Système de paliers de warns fixe :
+    - 3 warns  -> mute (timeout) 1 jour
+    - 5 warns  -> blacklist (ban) définitif
+    """
+    reason = f"Palier de {count} avertissement(s) atteint"
+
+    if count == 5:
+        try:
+            await member.send(embed=mod_embed(
+                "⛔ Tu as été blacklist (bl)",
+                f"**Serveur :** {guild.name}\n**Raison :** {reason}"
+            ))
+        except Exception:
+            pass
+        try:
+            await member.ban(reason=f"[AUTO-WARN] {reason}", delete_message_days=1)
+        except discord.Forbidden:
+            pass
+        else:
+            e = mod_embed(
+                "⛔ Blacklist automatique (5 warns)",
+                f"**Membre :** {member.mention} (`{member.id}`)\n"
+                f"**Warns :** {count}\n"
+                f"**Action :** Blacklist (bl) définitive",
+                discord.Color.dark_red()
+            )
+            await send_log(guild, e)
+
+    elif count == 3:
+        delta = timedelta(days=1)
+        until = datetime.now(timezone.utc) + delta
+        try:
+            await member.send(embed=mod_embed(
+                "🔇 Tu as été mute",
+                f"**Serveur :** {guild.name}\n**Durée :** 1 jour\n**Raison :** {reason}",
+                discord.Color.orange()
+            ))
+        except Exception:
+            pass
+        try:
+            await member.timeout(until, reason=f"[AUTO-WARN] {reason}")
+        except discord.Forbidden:
+            pass
+        else:
+            e = mod_embed(
+                "🔇 Mute automatique (3 warns)",
+                f"**Membre :** {member.mention} (`{member.id}`)\n"
+                f"**Warns :** {count}\n"
+                f"**Durée :** 1 jour\n"
+                f"**Fin :** <t:{int(until.timestamp())}:R>",
+                discord.Color.orange()
+            )
+            await send_log(guild, e)
+
 def is_exempt(message: discord.Message, am_cfg: dict) -> bool:
     member = message.author
     if member.guild_permissions.administrator:
@@ -356,13 +426,24 @@ def is_exempt(message: discord.Message, am_cfg: dict) -> bool:
 # ─────────────────────────────────────────
 @bot.event
 async def on_ready():
+    global _startup_tasks_launched
     print(f"✅ Connecté en tant que {bot.user} (ID: {bot.user.id})")
     print(f"   Préfixe : {PREFIX}")
-    for task in (check_giveaways, resume_tempbans, check_temproles):
-        if not task.is_running():
-            task.start()
+    if not check_giveaways.is_running():
+        check_giveaways.start()
+    # resume_tempbans et check_temproles sont des tâches "count=1" (une seule
+    # exécution au démarrage). on_ready peut se déclencher plusieurs fois
+    # (reconnexions gateway) : sans ce verrou, ces tâches seraient relancées
+    # à chaque reconnexion et reprogrammeraient en double les unbans / retraits
+    # de rôles temporaires déjà planifiés (bug corrigé).
+    if not _startup_tasks_launched:
+        _startup_tasks_launched = True
+        if not resume_tempbans.is_running():
+            resume_tempbans.start()
+        if not check_temproles.is_running():
+            check_temproles.start()
     await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.watching, name=f"pluvshiie lpb omgmgmg marie moi stppp"))
+        type=discord.ActivityType.watching, name=f"{PREFIX}help · modération"))
 
 @bot.event
 async def on_command(ctx):
@@ -1006,6 +1087,27 @@ async def on_message(message: discord.Message):
             await automod_action(message, f"Trop de mentions ({total_mentions}).", am_cfg)
             return
 
+    # ── Anti-emoji flood ──────────────────────────────────────────────────
+    if am_cfg.get("anti_emoji"):
+        max_e = am_cfg.get("max_emojis", 10)
+        emoji_count = len(EMOJI_PATTERN.findall(content))
+        if emoji_count >= max_e:
+            await automod_action(message, f"Trop d'emojis ({emoji_count}).", am_cfg)
+            return
+
+    # ── Anti-pièces jointes ───────────────────────────────────────────────
+    if am_cfg.get("anti_attachments") and len(message.attachments) >= am_cfg.get("max_attachments", 5):
+        await automod_action(message, f"Trop de pièces jointes ({len(message.attachments)}).", am_cfg)
+        return
+
+    # ── Anti-retours à la ligne (spam vertical) ─────────────────────────────
+    if am_cfg.get("anti_newlines"):
+        max_n = am_cfg.get("max_newlines", 10)
+        newline_count = content.count("\n")
+        if newline_count >= max_n:
+            await automod_action(message, f"Trop de retours à la ligne ({newline_count}).", am_cfg)
+            return
+
     # ── Anti-Zalgo ────────────────────────────────────────────────────────
     if am_cfg.get("anti_zalgo") and ZALGO_PATTERN.search(content):
         await automod_action(message, "Texte Zalgo/caractères spéciaux non autorisé.", am_cfg)
@@ -1051,17 +1153,16 @@ HELP_SECTIONS = {
         "description": "Ban, kick, mute, warn, tempban…",
         "color": discord.Color.red(),
         "commands": [
-            ("ban",        "<membre> [raison]",                  "Bannir définitivement un membre présent"),
             ("bl",         "<user_id> [raison]",                 "Bannir par ID, même hors serveur"),
-            ("unban",      "<user_id> [raison]",                 "Débannir un utilisateur par son ID"),
+            ("unbl",       "<user_id> [raison]",                 "Débannir un utilisateur par son ID"),
             ("blist",      "",                                    "Lister tous les membres bannis"),
             ("unbanall",   "",                                    "Débannir tout le monde (admin, confirmation)"),
             ("kick",       "<membre> [raison]",                  "Expulser un membre"),
-            ("softban",    "<membre> [raison]",                  "Ban + déban immédiat (efface les msgs)"),
-            ("tempban",    "<membre> <durée> <raison>",          "Ban temporaire (ex : 1d, 2h)"),
+            ("softbl",     "<membre> [raison]",                  "Ban + déban immédiat (efface les msgs)"),
+            ("tembl",      "<membre> <durée> <raison>",          "Ban temporaire (ex : 1d, 2h)"),
             ("mute",       "<membre> <durée> [raison]",          "Timeout un membre"),
             ("unmute",     "<membre> [raison]",                  "Retirer le timeout"),
-            ("warn",       "<membre> <raison>",                  "Ajouter un avertissement"),
+            ("warn",       "<membre> <raison>",                  "Ajouter un avertissement (3=mute 1j, 5=bl)"),
             ("unwarn",     "<membre> <id>",                      "Supprimer un warn spécifique"),
             ("clearwarns", "<membre>",                           "Effacer tous les warns d'un membre"),
             ("warns",      "[membre]",                           "Consulter les warns"),
@@ -1183,6 +1284,10 @@ HELP_SECTIONS = {
             ("automod set <règle> on/off",                  "",  "Activer/désactiver une règle"),
             ("automod action <delete|warn|mute|kick|ban>",  "",  "Choisir l'action automatique"),
             ("automod mute_duration <durée>",               "",  "Durée du mute automatique"),
+            ("automod max_mentions <nb>",                   "",  "Nb max de mentions par message"),
+            ("automod max_emojis <nb>",                      "",  "Nb max d'emojis par message"),
+            ("automod max_attachments <nb>",                "",  "Nb max de pièces jointes par message"),
+            ("automod max_newlines <nb>",                   "",  "Nb max de retours à la ligne par message"),
             ("automod warn_threshold <nb>",                 "",  "Nombre de warns avant action"),
             ("automod warn_action <action>",                "",  "Action au seuil de warns"),
             ("automod whitelist_domain add/remove <dom>",   "",  "Domaine autorisé malgré anti_links"),
@@ -1282,23 +1387,7 @@ async def help_cmd(ctx, commande: str = None):
 # ─────────────────────────────────────────
 #  SANCTIONS
 # ─────────────────────────────────────────
-@bot.command()
-@commands.has_permissions(ban_members=True)
-@commands.bot_has_permissions(ban_members=True)
-async def ban(ctx, member: discord.Member, *, reason: str = "Aucune raison fournie"):
-    """Bannir définitivement un membre du serveur."""
-    if not check_hierarchy(ctx, member):
-        return await ctx.reply("❌ Tu ne peux pas bannir ce membre (hiérarchie).")
-    try:
-        await member.send(embed=mod_embed("🔨 Tu as été banni", f"**Serveur :** {ctx.guild.name}\n**Raison :** {reason}"))
-    except Exception:
-        pass
-    await member.ban(reason=f"{ctx.author} : {reason}", delete_message_days=1)
-    e = mod_embed("🔨 Membre banni", f"**Cible :** {member.mention} (`{member.id}`)\n**Modérateur :** {ctx.author.mention}\n**Raison :** {reason}")
-    await ctx.send(embed=e)
-    await send_log(ctx.guild, e)
-
-@bot.command()
+@bot.command(name="unbl")
 @commands.has_permissions(ban_members=True)
 @commands.bot_has_permissions(ban_members=True)
 async def unban(ctx, user_id: int, *, reason: str = "Aucune raison fournie"):
@@ -1484,7 +1573,7 @@ async def unmute(ctx, member: discord.Member, *, reason: str = "Aucune raison fo
 @bot.command()
 @commands.has_permissions(kick_members=True)
 async def warn(ctx, member: discord.Member, *, reason: str):
-    """Avertir un membre et enregistrer l'avertissement."""
+    """Avertir un membre et enregistrer l'avertissement. (3 warns = mute 1j, 5 warns = bl)"""
     if not check_hierarchy(ctx, member):
         return await ctx.reply("❌ Tu ne peux pas avertir ce membre (hiérarchie).")
     gid, uid = str(ctx.guild.id), str(member.id)
@@ -1500,7 +1589,9 @@ async def warn(ctx, member: discord.Member, *, reason: str):
         await member.send(embed=warning_embed("⚠️ Tu as reçu un avertissement", f"**Serveur :** {ctx.guild.name}\n**Raison :** {reason}\n**Total :** {count} warn(s)"))
     except Exception:
         pass
-    # Vérifier le seuil de warns
+    # Paliers fixes : 3 warns = mute 1j, 5 warns = bl
+    await apply_warn_milestones(ctx.guild, member, count)
+    # Vérifier le seuil de warns configurable (optionnel, désactivé par défaut)
     am_cfg = get_automod_cfg(ctx.guild.id)
     await check_warn_threshold(ctx.guild, member, am_cfg)
 
@@ -1546,26 +1637,26 @@ async def warns(ctx, member: discord.Member = None):
         e.add_field(name=f"#{i} — {ts}", value=f"**Raison :** {w['reason']}\n**Mod :** {mod_str}", inline=False)
     await ctx.send(embed=e)
 
-@bot.command()
+@bot.command(name="softbl")
 @commands.has_permissions(ban_members=True)
 @commands.bot_has_permissions(ban_members=True)
 async def softban(ctx, member: discord.Member, *, reason: str = "Aucune raison fournie"):
     """Bannir puis débannir immédiatement (supprime les messages récents)."""
     if not check_hierarchy(ctx, member):
-        return await ctx.reply("❌ Tu ne peux pas softban ce membre.")
+        return await ctx.reply("❌ Tu ne peux pas softbl ce membre.")
     await member.ban(reason=f"[SOFTBAN] {ctx.author} : {reason}", delete_message_days=7)
     await ctx.guild.unban(member, reason="Softban — déban automatique")
     e = mod_embed("🪃 Softban", f"**Cible :** {member.mention}\n**Modérateur :** {ctx.author.mention}\n**Raison :** {reason}", discord.Color.orange())
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
-@bot.command()
+@bot.command(name="tembl")
 @commands.has_permissions(ban_members=True)
 @commands.bot_has_permissions(ban_members=True)
 async def tempban(ctx, member: discord.Member, duration: str, *, reason: str = "Aucune raison fournie"):
     """Bannir temporairement un membre. Durée : 10m, 2h, 1d."""
     if not check_hierarchy(ctx, member):
-        return await ctx.reply("❌ Tu ne peux pas tempban ce membre.")
+        return await ctx.reply("❌ Tu ne peux pas tembl ce membre.")
     delta = parse_duration(duration)
     if not delta:
         return await ctx.reply("❌ Durée invalide. Exemples : `10m`, `2h`, `1d`.")
@@ -2461,14 +2552,11 @@ async def create_emoji(ctx, emoji: discord.PartialEmoji):
     if len(ctx.guild.emojis) >= ctx.guild.emoji_limit:
         return await ctx.reply("❌ La limite d'emojis du serveur est atteinte.")
     try:
-        async with ctx.bot.http._HTTPClient__session.get(str(emoji.url)) as resp:
-            if resp.status != 200:
-                return await ctx.reply("❌ Impossible de télécharger cet emoji.")
-            data = await resp.read()
+        data = await emoji.read()
         new_emoji = await ctx.guild.create_custom_emoji(name=emoji.name, image=data, reason=f"Emoji ajouté par {ctx.author}")
         e = success_embed("✅ Emoji ajouté", f"Emoji créé : {new_emoji}\nNom : `{new_emoji.name}`\nAjouté par : {ctx.author.mention}")
         await ctx.send(embed=e)
-    except discord.HTTPException:
+    except (discord.HTTPException, discord.NotFound):
         await ctx.reply("❌ Impossible d'ajouter cet emoji.")
 
 @bot.command()
@@ -2739,15 +2827,18 @@ async def setmuterole(ctx, role: discord.Role):
 #  AUTOMOD — Commande principale
 # ─────────────────────────────────────────
 AUTOMOD_RULES = {
-    "links":    "anti_links",
-    "invites":  "anti_invites",
-    "spam":     "anti_spam",
-    "caps":     "anti_caps",
-    "mentions": "anti_mentions",
-    "badwords": "anti_badwords",
-    "zalgo":    "anti_zalgo",
-    "flood":    "anti_flood",
-    "scam":     "anti_scam",
+    "links":       "anti_links",
+    "invites":     "anti_invites",
+    "spam":        "anti_spam",
+    "caps":        "anti_caps",
+    "mentions":    "anti_mentions",
+    "badwords":    "anti_badwords",
+    "zalgo":       "anti_zalgo",
+    "flood":       "anti_flood",
+    "scam":        "anti_scam",
+    "emoji":       "anti_emoji",
+    "attachments": "anti_attachments",
+    "newlines":    "anti_newlines",
 }
 
 @bot.command(name="automod")
@@ -2777,7 +2868,10 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
                 f"{oc(am_cfg.get('anti_badwords'))} **Mots interdits** ({len(am_cfg.get('badwords', []))} mot(s))\n"
                 f"{oc(am_cfg.get('anti_zalgo'))} **Anti-Zalgo**\n"
                 f"{oc(am_cfg.get('anti_flood'))} **Anti-flood** (seuil {am_cfg.get('flood_count')})\n"
-                f"{oc(am_cfg.get('anti_scam'))} **Anti-scam**"
+                f"{oc(am_cfg.get('anti_scam'))} **Anti-scam**\n"
+                f"{oc(am_cfg.get('anti_emoji'))} **Anti-emoji** (max {am_cfg.get('max_emojis')})\n"
+                f"{oc(am_cfg.get('anti_attachments'))} **Anti-pièces jointes** (max {am_cfg.get('max_attachments')})\n"
+                f"{oc(am_cfg.get('anti_newlines'))} **Anti-retours à la ligne** (max {am_cfg.get('max_newlines')})"
             ),
             inline=False
         )
@@ -2929,6 +3023,39 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
         save_config()
         await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Nb max mentions : **{val}**."))
 
+    # ── MAX_EMOJIS ────────────────────────────────────────────────────────
+    elif sc == "max_emojis":
+        if not args or not args[0].isdigit():
+            return await ctx.reply("❌ Usage : `+automod max_emojis <nombre>`")
+        val = int(args[0])
+        if not 1 <= val <= 100:
+            return await ctx.reply("❌ Valeur entre 1 et 100.")
+        am_cfg["max_emojis"] = val
+        save_config()
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Nb max emojis : **{val}**."))
+
+    # ── MAX_ATTACHMENTS ───────────────────────────────────────────────────
+    elif sc == "max_attachments":
+        if not args or not args[0].isdigit():
+            return await ctx.reply("❌ Usage : `+automod max_attachments <nombre>`")
+        val = int(args[0])
+        if not 1 <= val <= 20:
+            return await ctx.reply("❌ Valeur entre 1 et 20.")
+        am_cfg["max_attachments"] = val
+        save_config()
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Nb max pièces jointes : **{val}**."))
+
+    # ── MAX_NEWLINES ──────────────────────────────────────────────────────
+    elif sc == "max_newlines":
+        if not args or not args[0].isdigit():
+            return await ctx.reply("❌ Usage : `+automod max_newlines <nombre>`")
+        val = int(args[0])
+        if not 1 <= val <= 100:
+            return await ctx.reply("❌ Valeur entre 1 et 100.")
+        am_cfg["max_newlines"] = val
+        save_config()
+        await ctx.reply(embed=success_embed("🛡️ AutoMod", f"Nb max retours à la ligne : **{val}**."))
+
     # ── FLOOD_COUNT ───────────────────────────────────────────────────────
     elif sc == "flood_count":
         if not args or not args[0].isdigit():
@@ -3063,6 +3190,8 @@ if __name__ == "__main__":
             break
 
         time.sleep(RETRY_DELAY)
-
-        # Recréer le bot pour éviter des états corrompus
-        bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+        # NOTE : on NE recrée PAS d'objet Bot ici. Tous les @bot.command et
+        # @bot.event ont été enregistrés une seule fois, au chargement du
+        # module, sur cette instance précise de `bot`. Recréer un nouvel
+        # objet `commands.Bot` à ce stade produirait un bot sans aucune
+        # commande/événement enregistré (bug corrigé).
