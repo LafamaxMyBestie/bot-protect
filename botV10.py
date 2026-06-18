@@ -30,6 +30,8 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 intents.guilds = True
+intents.presences = True   # OBLIGATOIRE pour que +stats connaisse le vrai statut (en ligne/hors ligne) des membres
+intents.voice_states = True  # déjà inclus par default(), explicite ici pour la lisibilité (compte les membres en vocal)
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
@@ -442,6 +444,10 @@ async def on_ready():
             resume_tempbans.start()
         if not check_temproles.is_running():
             check_temproles.start()
+        # BUG CORRIGÉ : register_ticket_views() n'était jamais appelée. Sans ça,
+        # les menus déroulants/boutons des panneaux de tickets cessaient de
+        # répondre après chaque redémarrage du bot (vue non persistante ré-attachée).
+        register_ticket_views()
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching, name=f"{PREFIX}help · modération"))
 
@@ -2232,19 +2238,9 @@ def get_open_ticket(guild_id, channel_id):
     return tdata, ttype
 
 def build_panel_view(gid: str, type_ids: list) -> discord.ui.View:
-    """Construit la vue (boutons d'ouverture) à partir des types de tickets actuels."""
-    tcfg = get_ticket_cfg(gid)
+    """Construit la vue (menu déroulant d'ouverture) à partir des types de tickets actuels."""
     view = discord.ui.View(timeout=None)
-    for tid in type_ids:
-        t = tcfg["types"].get(tid)
-        if not t:
-            continue
-        style = BUTTON_STYLES.get(t.get("style", "primary"), discord.ButtonStyle.primary)
-        try:
-            view.add_item(TicketOpenButton(tid, t.get("label", tid)[:80], t.get("emoji") or None, style))
-        except Exception:
-            # emoji invalide par ex. : on retente sans emoji plutôt que de casser tout le panneau
-            view.add_item(TicketOpenButton(tid, t.get("label", tid)[:80], None, style))
+    view.add_item(TicketOpenSelect(gid, type_ids))
     return view
 
 async def refresh_panels(guild: discord.Guild):
@@ -2354,13 +2350,47 @@ async def close_ticket_channel(channel: discord.TextChannel, closer: discord.abc
 
 # ── Composants UI ─────────────────────────────────────────────────────────
 
-class TicketOpenButton(discord.ui.Button):
-    def __init__(self, type_id: str, label: str, emoji, style: discord.ButtonStyle):
-        super().__init__(label=label, emoji=emoji, style=style, custom_id=f"ticket_open:{type_id}")
-        self.type_id = type_id
+class TicketOpenSelect(discord.ui.Select):
+    """Menu déroulant utilisé sur le panneau de tickets : chaque option correspond à un type de
+    ticket configuré. Remplace l'ancien système par boutons pour un rendu plus propre, surtout
+    quand il y a beaucoup de catégories (jusqu'à 25 options vs 25 boutons qui prennent 5 lignes)."""
+    def __init__(self, gid: str, type_ids: list):
+        tcfg = get_ticket_cfg(gid)
+        options = []
+        for tid in type_ids:
+            t = tcfg["types"].get(tid)
+            if not t:
+                continue
+            emoji = t.get("emoji") or None
+            try:
+                options.append(discord.SelectOption(
+                    label=t.get("label", tid)[:100],
+                    value=tid,
+                    description=(t.get("description") or "Ouvrir un ticket dans cette catégorie")[:100],
+                    emoji=emoji,
+                ))
+            except Exception:
+                # emoji invalide : on retente sans emoji plutôt que de casser tout le panneau
+                options.append(discord.SelectOption(
+                    label=t.get("label", tid)[:100],
+                    value=tid,
+                    description=(t.get("description") or "Ouvrir un ticket dans cette catégorie")[:100],
+                ))
+        if not options:
+            options = [discord.SelectOption(label="Aucune catégorie disponible", value="__none__")]
+        super().__init__(
+            placeholder="🎫 Choisissez une catégorie…",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="ticket_open_select",
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        await handle_ticket_button(interaction, self.type_id)
+        type_id = self.values[0]
+        if type_id == "__none__":
+            return await interaction.response.send_message("❌ Aucune catégorie de ticket n'est configurée.", ephemeral=True)
+        await handle_ticket_button(interaction, type_id)
 
 class TicketOpenModal(discord.ui.Modal):
     def __init__(self, type_id: str, questions: list):
@@ -2632,7 +2662,7 @@ async def create_ticket_channel(interaction: discord.Interaction, type_id: str, 
 @bot.command(name="ticketadd")
 @commands.has_permissions(manage_guild=True)
 async def ticketadd(ctx, *, nom: str):
-    """Créer un nouveau type de ticket (= un bouton). Usage : +ticketadd <nom>"""
+    """Créer un nouveau type de ticket (= une option du menu déroulant). Usage : +ticketadd <nom>"""
     gid = str(ctx.guild.id)
     tcfg = get_ticket_cfg(gid)
     type_id = slugify(nom)
@@ -2640,13 +2670,14 @@ async def ticketadd(ctx, *, nom: str):
         return await ctx.reply("❌ Nom invalide.")
     if type_id in tcfg["types"]:
         return await ctx.reply(f"❌ Un type `{type_id}` existe déjà.")
-    if len(tcfg["types"]) >= 23:
-        return await ctx.reply("❌ Limite de 23 types de tickets atteinte (max 25 boutons par panneau).")
+    if len(tcfg["types"]) >= 25:
+        return await ctx.reply("❌ Limite de 25 types de tickets atteinte (max 25 options par menu déroulant).")
 
     tcfg["types"][type_id] = {
         "label":           nom[:80],
         "emoji":           "🎫",
         "style":           "primary",
+        "description":     None,
         "category_id":     None,
         "staff_roles":     [],
         "welcome_message": None,
@@ -2660,9 +2691,11 @@ async def ticketadd(ctx, *, nom: str):
         f"`{PREFIX}ticketedit {type_id} category <catégorie>`\n"
         f"`{PREFIX}ticketrole {type_id} add @rôle`\n"
         f"`{PREFIX}ticketedit {type_id} emoji <emoji>`\n"
+        f"`{PREFIX}ticketedit {type_id} description <texte affiché sous l'option>`\n"
         f"Puis envoie le panneau avec `{PREFIX}ticketpanel #salon Titre | Description`."
     ))
     await refresh_panels(ctx.guild)
+
 
 @bot.command(name="ticketremove")
 @commands.has_permissions(manage_guild=True)
@@ -3013,30 +3046,41 @@ async def couples(ctx):
 # ─────────────────────────────────────────
 @bot.command()
 async def stats(ctx):
-    """Afficher les statistiques détaillées du serveur (comme sur l'image)."""
+    """Afficher les statistiques en direct du serveur : membres, en ligne/hors ligne, vocal, boosts."""
     g = ctx.guild
 
-    # Compter les membres en ligne, hors ligne, en vocal, en stream, muets
+    # S'assurer que le cache des membres est bien rempli avant de compter
+    # (sur un gros serveur, discord.py peut ne pas avoir tout chargé au moment
+    # de la commande si le chunking initial n'est pas terminé).
+    if g.chunked is False:
+        try:
+            await g.chunk(cache=True)
+        except Exception:
+            pass
+
     online = offline = in_voice = streaming = voice_muted = 0
     for member in g.members:
         if member.bot:
             continue
-        if member.status in (discord.Status.online, discord.Status.idle, discord.Status.dnd):
-            online += 1
-        else:
+        if member.status is discord.Status.offline or member.status is None:
             offline += 1
-        if member.voice:
+        else:
+            online += 1
+        if member.voice and member.voice.channel:
             in_voice += 1
             if member.voice.self_stream or member.voice.self_video:
                 streaming += 1
             if member.voice.self_mute or member.voice.mute:
                 voice_muted += 1
 
-    boosts = g.premium_subscription_count or 0
-    total  = g.member_count or 0
+    boosts     = g.premium_subscription_count or 0
+    boost_tier = g.premium_tier or 0
+    total      = g.member_count or len([m for m in g.members])
+    humans     = total - sum(1 for m in g.members if m.bot)
+    bots       = sum(1 for m in g.members if m.bot)
 
     e = discord.Embed(
-        title=f"🏆 {g.name} — Statistiques",
+        title=f"📊 {g.name} — Statistiques en direct",
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc)
     )
@@ -3046,7 +3090,15 @@ async def stats(ctx):
     e.add_field(
         name="👥 Membres",
         value=(
-            f"👤 **Membres** — {total}\n"
+            f"**Total** — {total}\n"
+            f"🧍 **Humains** — {humans}\n"
+            f"🤖 **Bots** — {bots}"
+        ),
+        inline=True
+    )
+    e.add_field(
+        name="🟢 Présence",
+        value=(
             f"🟢 **En ligne** — {online}\n"
             f"⚫ **Hors ligne** — {offline}"
         ),
@@ -3057,35 +3109,37 @@ async def stats(ctx):
         value=(
             f"🔊 **En vocal** — {in_voice}\n"
             f"📡 **En stream** — {streaming}\n"
-            f"🔇 **Mute** — {voice_muted}"
+            f"🔇 **Muets** — {voice_muted}"
         ),
         inline=True
     )
     e.add_field(
-        name="✨ Boosts",
-        value=f"<:boost:1> **Boosts** — {boosts}\n⭐ **Niveau** — {g.premium_tier}",
-        inline=False
+        name="✨ Boosts du serveur",
+        value=f"💎 **Boosts** — {boosts}\n⭐ **Niveau** — {boost_tier}",
+        inline=True
     )
     e.add_field(
-        name="📊 Activité bot",
+        name="🏠 Salons & rôles",
         value=(
-            f"💬 **Commandes utilisées** — {_bot_stats['commands_used']}\n"
-            f"🤖 **Actions AutoMod** — {_bot_stats['automod_actions']}\n"
-            f"📨 **Messages (session)** — {_bot_stats['messages_today']}"
-        ),
-        inline=False
-    )
-    e.add_field(
-        name="🏠 Serveur",
-        value=(
-            f"📝 **Salons texte** — {len(g.text_channels)}\n"
-            f"🔊 **Salons vocaux** — {len(g.voice_channels)}\n"
+            f"📝 **Texte** — {len(g.text_channels)}\n"
+            f"🔊 **Vocaux** — {len(g.voice_channels)}\n"
             f"🏷️ **Rôles** — {len(g.roles)}"
+        ),
+        inline=True
+    )
+    e.add_field(
+        name="🤖 Activité du bot (session)",
+        value=(
+            f"💬 **Commandes** — {_bot_stats['commands_used']}\n"
+            f"🛡️ **Actions AutoMod** — {_bot_stats['automod_actions']}\n"
+            f"📨 **Messages vus** — {_bot_stats['messages_today']}"
         ),
         inline=True
     )
     e.set_footer(text=f"Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
     await ctx.send(embed=e)
+
+
 
 @bot.command()
 async def botinfo(ctx):
