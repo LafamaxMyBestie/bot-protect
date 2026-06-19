@@ -482,6 +482,53 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_member_join(member):
+    # ── Anti-bot : expulse tout bot ajouté sauf par le propriétaire du serveur ──
+    if member.bot:
+        guild = member.guild
+        owner_id = guild.owner_id  # seul le propriétaire (couronne) est autorisé
+
+        # Récupérer qui a ajouté le bot via les logs d'audit
+        inviter_id = None
+        try:
+            async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.bot_add):
+                if entry.target and entry.target.id == member.id:
+                    inviter_id = entry.user.id if entry.user else None
+                    break
+        except discord.Forbidden:
+            pass
+
+        # Si le bot n'a pas été ajouté par le propriétaire → expulsion du bot + de l'inviteur
+        if inviter_id != owner_id:
+            # 1) Expulser le bot
+            try:
+                await member.kick(reason="[Anti-Bot] Seul le propriétaire du serveur peut ajouter des bots.")
+            except discord.Forbidden:
+                pass
+
+            # 2) Expulser l'inviteur s'il est encore dans le serveur
+            inviter_member = guild.get_member(inviter_id) if inviter_id else None
+            inviter_kicked = False
+            if inviter_member:
+                try:
+                    await inviter_member.kick(reason="[Anti-Bot] A ajouté un bot sans autorisation du propriétaire.")
+                    inviter_kicked = True
+                except discord.Forbidden:
+                    pass
+
+            # 3) Log de l'action
+            inviter_info = f"<@{inviter_id}> (`{inviter_id}`)" if inviter_id else "Inconnu"
+            kick_status  = "✅ Expulsé" if inviter_kicked else "❌ Non expulsé (permissions insuffisantes)"
+            e = mod_embed(
+                "🤖 Anti-Bot — Bot + Inviteur expulsés",
+                f"**Bot expulsé :** {member} (`{member.id}`)\n"
+                f"**Ajouté par :** {inviter_info}\n"
+                f"**Inviteur expulsé :** {kick_status}\n"
+                f"**Raison :** Seul le propriétaire du serveur peut ajouter des bots.",
+                discord.Color.red()
+            )
+            await send_log(guild, e)
+            return  # on arrête ici, pas de rôle auto ni de welcome pour un bot expulsé
+
     _bot_stats["members_joined_week"] += 1
     cfg = get_guild_cfg(member.guild.id)
     auto_role_id = cfg.get("auto_role")
@@ -505,6 +552,9 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_remove(member):
+    # Ne pas logger la suppression des bots (déjà géré par l'anti-bot)
+    if member.bot:
+        return
     cfg = get_guild_cfg(member.guild.id)
     ch_id = cfg.get("log_channel")
     if not ch_id:
@@ -536,6 +586,7 @@ async def on_message_delete(message: discord.Message):
     data = {
         "content":     message.content[:1900],
         "channel_id":  message.channel.id,
+        "author_id":   message.author.id,
         "created_at":  datetime.now(timezone.utc).isoformat(),
         "attachments": [a.url for a in message.attachments[:5]]
     }
@@ -1309,6 +1360,8 @@ HELP_SECTIONS = {
     },
 }
 
+HELP_PAGE_SIZE = 6  # commandes max par page
+
 def build_home_embed(author: discord.User) -> discord.Embed:
     e = discord.Embed(
         title="🤖 Aide — Menu principal",
@@ -1327,7 +1380,8 @@ def build_home_embed(author: discord.User) -> discord.Embed:
     e.set_footer(text=f"Demandé par {author}", icon_url=author.display_avatar.url)
     return e
 
-def build_section_embed(key: str, author: discord.User) -> discord.Embed:
+def build_section_pages(key: str) -> list[list[str]]:
+    """Découpe les commandes d'une section en pages de HELP_PAGE_SIZE lignes."""
     data = HELP_SECTIONS[key]
     lines = []
     for name, args, desc in data["commands"]:
@@ -1335,18 +1389,32 @@ def build_section_embed(key: str, author: discord.User) -> discord.Embed:
             lines.append(f"`{PREFIX}{name}` `{args}`\n┗ {desc}")
         else:
             lines.append(f"`{PREFIX}{name}`\n┗ {desc}")
+    # Découper en pages
+    pages = [lines[i:i + HELP_PAGE_SIZE] for i in range(0, len(lines), HELP_PAGE_SIZE)]
+    return pages if pages else [[]]
+
+def build_section_embed(key: str, author: discord.User, page: int = 0) -> discord.Embed:
+    data  = HELP_SECTIONS[key]
+    pages = build_section_pages(key)
+    total = len(pages)
+    page  = max(0, min(page, total - 1))
     e = discord.Embed(
         title=data["label"],
-        description="\n".join(lines),
+        description="\n".join(pages[page]),
         color=data["color"],
         timestamp=datetime.now(timezone.utc)
     )
-    e.set_footer(text=f"Demandé par {author} • {PREFIX}help <commande> pour plus de détails", icon_url=author.display_avatar.url)
+    footer_page = f"Page {page + 1}/{total} • {len(HELP_SECTIONS[key]['commands'])} commande(s)"
+    e.set_footer(
+        text=f"Demandé par {author} • {footer_page} • {PREFIX}help <commande> pour plus de détails",
+        icon_url=author.display_avatar.url
+    )
     return e
 
 class HelpSelect(discord.ui.Select):
-    def __init__(self, author: discord.User):
-        self.author = author
+    def __init__(self, author: discord.User, view_ref):
+        self.author   = author
+        self.view_ref = view_ref
         options = [
             discord.SelectOption(label="🏠 Accueil", value="home", description="Retourner au menu principal")
         ] + [
@@ -1362,22 +1430,90 @@ class HelpSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
             return await interaction.response.send_message("❌ Ce menu ne t'appartient pas.", ephemeral=True)
-        if self.values[0] == "home":
+        selected = self.values[0]
+        self.view_ref.current_section = selected
+        self.view_ref.current_page    = 0
+        self.view_ref.update_buttons()
+        if selected == "home":
             embed = build_home_embed(self.author)
         else:
-            embed = build_section_embed(self.values[0], self.author)
-        await interaction.response.edit_message(embed=embed)
+            embed = build_section_embed(selected, self.author, 0)
+        await interaction.response.edit_message(embed=embed, view=self.view_ref)
 
 class HelpView(discord.ui.View):
     def __init__(self, author: discord.User):
-        super().__init__(timeout=120)
-        self.add_item(HelpSelect(author))
+        super().__init__(timeout=180)
+        self.author          = author
+        self.current_section = "home"
+        self.current_page    = 0
+        self.message         = None
+
+        self.select = HelpSelect(author, self)
+        self.add_item(self.select)
+
+        # Bouton accueil
+        self.home_btn = discord.ui.Button(emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+        self.home_btn.callback = self.go_home
+        self.add_item(self.home_btn)
+
+        # Bouton page précédente
+        self.prev_btn = discord.ui.Button(emoji="◀", style=discord.ButtonStyle.primary, row=1, disabled=True)
+        self.prev_btn.callback = self.go_prev
+        self.add_item(self.prev_btn)
+
+        # Label de page (bouton désactivé, juste pour l'affichage)
+        self.page_label = discord.ui.Button(label="1/1", style=discord.ButtonStyle.secondary, row=1, disabled=True)
+        self.add_item(self.page_label)
+
+        # Bouton page suivante
+        self.next_btn = discord.ui.Button(emoji="▶", style=discord.ButtonStyle.primary, row=1, disabled=True)
+        self.next_btn.callback = self.go_next
+        self.add_item(self.next_btn)
+
+        self.update_buttons()
+
+    def _total_pages(self) -> int:
+        if self.current_section == "home":
+            return 1
+        return len(build_section_pages(self.current_section))
+
+    def update_buttons(self):
+        total = self._total_pages()
+        self.prev_btn.disabled  = (self.current_page <= 0 or self.current_section == "home")
+        self.next_btn.disabled  = (self.current_page >= total - 1 or self.current_section == "home")
+        self.page_label.label   = f"{self.current_page + 1}/{total}"
+        self.page_label.disabled = True
+
+    async def go_home(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            return await interaction.response.send_message("❌ Ce menu ne t'appartient pas.", ephemeral=True)
+        self.current_section = "home"
+        self.current_page    = 0
+        self.update_buttons()
+        await interaction.response.edit_message(embed=build_home_embed(self.author), view=self)
+
+    async def go_prev(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            return await interaction.response.send_message("❌ Ce menu ne t'appartient pas.", ephemeral=True)
+        self.current_page = max(0, self.current_page - 1)
+        self.update_buttons()
+        embed = build_section_embed(self.current_section, self.author, self.current_page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def go_next(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            return await interaction.response.send_message("❌ Ce menu ne t'appartient pas.", ephemeral=True)
+        self.current_page = min(self._total_pages() - 1, self.current_page + 1)
+        self.update_buttons()
+        embed = build_section_embed(self.current_section, self.author, self.current_page)
+        await interaction.response.edit_message(embed=embed, view=self)
 
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
         try:
-            await self.message.edit(view=self)
+            if self.message:
+                await self.message.edit(view=self)
         except Exception:
             pass
 
@@ -1677,7 +1813,12 @@ async def tempban(ctx, member: discord.Member, duration: str, *, reason: str = "
         await member.send(embed=mod_embed("⏳ Ban temporaire", f"**Serveur :** {ctx.guild.name}\n**Durée :** {duration}\n**Raison :** {reason}"))
     except Exception:
         pass
-    await member.ban(reason=f"[TEMPBAN {duration}] {ctx.author} : {reason}", delete_message_days=1)
+    try:
+        await member.ban(reason=f"[TEMPBAN {duration}] {ctx.author} : {reason}", delete_message_days=1)
+    except discord.Forbidden:
+        return await ctx.reply("❌ Je n'ai pas la permission de bannir ce membre.")
+    except discord.HTTPException as exc:
+        return await ctx.reply(f"❌ Erreur lors du ban : {exc}")
     gid = str(ctx.guild.id)
     tempban_db.setdefault(gid, {})[str(member.id)] = {
         "end_ts": until_ts, "reason": reason, "mod_id": str(ctx.author.id),
@@ -1720,7 +1861,7 @@ async def resume_tempbans():
                     await guild.unban(user, reason="Tempban expiré (reprise)")
                 except Exception:
                     pass
-                bans.pop(uid)
+                tempban_db[gid].pop(uid, None)
             else:
                 async def _unban(g=guild, u_id=uid, delay=remaining, g_id=gid):
                     await asyncio.sleep(delay)
@@ -1774,7 +1915,7 @@ async def purge(ctx, member: discord.Member, amount: int = 100):
     await ctx.message.delete()
     after_limit = datetime.now(timezone.utc) - timedelta(days=14)
     def check(m): return m.author == member
-    deleted = await ctx.channel.purge(limit=min(amount * 10, 2000), check=check, after=after_limit)
+    deleted = await ctx.channel.purge(limit=min(amount * 10, 2000), check=check, after=after_limit, bulk=True)
     deleted = deleted[:amount]
     e = success_embed("🧹 Purge", f"**{len(deleted)}** message(s) de {member.mention} supprimé(s).\n**Modérateur :** {ctx.author.mention}")
     msg = await ctx.send(embed=e)
@@ -2136,14 +2277,14 @@ async def check_temproles():
             member = guild.get_member(int(rdata["member_id"]))
             role   = guild.get_role(int(rdata["role_id"]))
             if not member or not role:
-                roles.pop(key)
+                temproles_db[gid].pop(key, None)
                 continue
             if remaining <= 0:
                 try:
                     await member.remove_roles(role, reason="Rôle temporaire expiré (reprise)")
                 except Exception:
                     pass
-                roles.pop(key)
+                temproles_db[gid].pop(key, None)
             else:
                 async def _remove(m=member, r=role, g=guild, g_id=gid, k=key, delay=remaining):
                     await asyncio.sleep(delay)
@@ -3080,65 +3221,22 @@ async def stats(ctx):
     bots       = sum(1 for m in g.members if m.bot)
 
     e = discord.Embed(
-        title=f"📊 {g.name} — Statistiques en direct",
-        color=discord.Color.blurple(),
+        title=f"🏆 {g.name} Statistiques",
+        color=discord.Color.from_str("#2b2d31"),
         timestamp=datetime.now(timezone.utc)
     )
     if g.icon:
         e.set_thumbnail(url=g.icon.url)
 
-    e.add_field(
-        name="👥 Membres",
-        value=(
-            f"**Total** — {total}\n"
-            f"🧍 **Humains** — {humans}\n"
-            f"🤖 **Bots** — {bots}"
-        ),
-        inline=True
+    e.description = (
+        f"*Membres :* **{total}**\n"
+        f"*En ligne :* **{online}**\n"
+        f"*En vocal :* **{in_voice}**\n"
+        f"*En stream :* **{streaming}**\n"
+        f"*Boosts :* **{boosts}**"
     )
-    e.add_field(
-        name="🟢 Présence",
-        value=(
-            f"🟢 **En ligne** — {online}\n"
-            f"⚫ **Hors ligne** — {offline}"
-        ),
-        inline=True
-    )
-    e.add_field(
-        name="🎙️ Vocal",
-        value=(
-            f"🔊 **En vocal** — {in_voice}\n"
-            f"📡 **En stream** — {streaming}\n"
-            f"🔇 **Muets** — {voice_muted}"
-        ),
-        inline=True
-    )
-    e.add_field(
-        name="✨ Boosts du serveur",
-        value=f"💎 **Boosts** — {boosts}\n⭐ **Niveau** — {boost_tier}",
-        inline=True
-    )
-    e.add_field(
-        name="🏠 Salons & rôles",
-        value=(
-            f"📝 **Texte** — {len(g.text_channels)}\n"
-            f"🔊 **Vocaux** — {len(g.voice_channels)}\n"
-            f"🏷️ **Rôles** — {len(g.roles)}"
-        ),
-        inline=True
-    )
-    e.add_field(
-        name="🤖 Activité du bot (session)",
-        value=(
-            f"💬 **Commandes** — {_bot_stats['commands_used']}\n"
-            f"🛡️ **Actions AutoMod** — {_bot_stats['automod_actions']}\n"
-            f"📨 **Messages vus** — {_bot_stats['messages_today']}"
-        ),
-        inline=True
-    )
-    e.set_footer(text=f"Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
-    await ctx.send(embed=e)
 
+    await ctx.send(embed=e)
 
 
 @bot.command()
@@ -3209,9 +3307,15 @@ async def calc(ctx, *, expression: str):
     if not safe_expr.strip():
         return await ctx.reply("❌ Expression invalide.")
     try:
-        result = eval(safe_expr, {"__builtins__": {}})
+        loop = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: eval(safe_expr, {"__builtins__": {}})),
+            timeout=2.0
+        )
         e = success_embed("🧮 Calculatrice", f"**Expression :** `{safe_expr.strip()}`\n**Résultat :** `{result}`")
         await ctx.send(embed=e)
+    except asyncio.TimeoutError:
+        await ctx.reply("❌ Expression trop complexe ou boucle infinie détectée.")
     except ZeroDivisionError:
         await ctx.reply("❌ Division par zéro impossible.")
     except Exception:
@@ -3305,17 +3409,31 @@ async def poll(ctx, *, contenu: str):
 
 @bot.command(name="snipe")
 @commands.has_permissions(manage_messages=True)
-async def snipe(ctx, member: discord.Member):
-    """Afficher les derniers messages supprimés d'un membre."""
-    gid, uid = ctx.guild.id, member.id
-    entries = _snipe_cache.get(gid, {}).get(uid, [])
-    if not entries:
-        return await ctx.reply("❌ Aucun message supprimé récent trouvé.")
+async def snipe(ctx, member: discord.Member = None):
+    """Afficher les derniers messages supprimés d'un membre (ou du salon si aucun membre précisé)."""
+    gid = ctx.guild.id
     now = datetime.now(timezone.utc)
-    valid = [e for e in reversed(entries) if now - datetime.fromisoformat(e["created_at"]) <= SNIPE_MAX_AGE][:10]
+
+    if member:
+        raw_entries = _snipe_cache.get(gid, {}).get(member.id, [])
+        title = f"🕵️ Messages supprimés de {member}"
+    else:
+        # Rassemble tous les messages supprimés du serveur, toutes provenances
+        raw_entries = []
+        for uid, entries in _snipe_cache.get(gid, {}).items():
+            raw_entries.extend(entries)
+        raw_entries.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        title = "🕵️ Derniers messages supprimés du serveur"
+
+    valid = [
+        entry for entry in raw_entries
+        if now - datetime.fromisoformat(entry["created_at"]) <= SNIPE_MAX_AGE
+    ][:10]
+
     if not valid:
         return await ctx.reply("❌ Aucun message supprimé récent trouvé.")
-    e = warning_embed(f"🕵️ Messages supprimés de {member}", "")
+
+    snipe_embed = warning_embed(title, "")
     for i, entry in enumerate(valid, 1):
         ch = ctx.guild.get_channel(entry["channel_id"])
         content = (entry["content"] or "[vide]")[:800]
@@ -3323,12 +3441,16 @@ async def snipe(ctx, member: discord.Member):
             ts = f"<t:{int(datetime.fromisoformat(entry['created_at']).timestamp())}:R>"
         except Exception:
             ts = "?"
-        val = f"**Salon :** {ch.mention if ch else '?'}\n**Supprimé :** {ts}\n\n{content}"
+        # Identifier l'auteur si disponible (snipe global)
+        author_id = entry.get("author_id")
+        author_str = f"<@{author_id}> · " if author_id and not member else ""
+        val = f"{author_str}**Salon :** {ch.mention if ch else '?'}\n**Supprimé :** {ts}\n\n{content}"
         if entry.get("attachments"):
             val += "\n\n📎 " + "\n".join(entry["attachments"][:3])
-        e.add_field(name=f"Message #{i}", value=val[:1024], inline=False)
-    e.set_thumbnail(url=member.display_avatar.url)
-    await ctx.send(embed=e)
+        snipe_embed.add_field(name=f"Message #{i}", value=val[:1024], inline=False)
+    if member:
+        snipe_embed.set_thumbnail(url=member.display_avatar.url)
+    await ctx.send(embed=snipe_embed)
 
 @bot.command()
 async def remind(ctx, duration: str, *, message: str):
