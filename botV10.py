@@ -96,6 +96,10 @@ _bot_stats = {
     "messages_today": 0,
     "members_joined_week": 0,
 }
+
+# ── Suivi des stats membres (messages + temps vocal) ─────────────────────────
+# Structure : { guild_id: { member_id: { "messages": int, "voice_seconds": float, "voice_joined": float|None } } }
+_member_stats: dict[int, dict[int, dict]] = defaultdict(lambda: defaultdict(lambda: {"messages": 0, "voice_seconds": 0.0, "voice_joined": None}))
 SNIPE_MAX_AGE     = timedelta(days=3)
 SNIPE_MAX_PER_USER = 25
 _start_time = datetime.now(timezone.utc)
@@ -1003,6 +1007,24 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if not ch:
         return
 
+    # ── Suivi temps vocal pour +statistic ────────────────────────────────
+    if not member.bot:
+        stats = _member_stats[member.guild.id][member.id]
+        now_ts = time.time()
+        if not before.channel and after.channel:
+            # Connexion vocal
+            stats["voice_joined"] = now_ts
+        elif before.channel and not after.channel:
+            # Déconnexion vocal
+            if stats["voice_joined"] is not None:
+                stats["voice_seconds"] += now_ts - stats["voice_joined"]
+                stats["voice_joined"] = None
+        elif before.channel and after.channel and before.channel != after.channel:
+            # Déplacement : on cumule le temps passé dans l'ancien salon
+            if stats["voice_joined"] is not None:
+                stats["voice_seconds"] += now_ts - stats["voice_joined"]
+            stats["voice_joined"] = now_ts
+
     if not before.channel and after.channel:
         e = success_embed(
             "🔊 Salon vocal — Connexion",
@@ -1088,6 +1110,9 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
+
+    # ── Suivi messages pour +statistic ────────────────────────────────────
+    _member_stats[message.guild.id][message.author.id]["messages"] += 1
 
     am_cfg = get_automod_cfg(message.guild.id)
 
@@ -1314,6 +1339,8 @@ HELP_SECTIONS = {
         "description": "Rôles, profils, accueil…",
         "color": discord.Color.green(),
         "commands": [
+            ("invites",             "[@membre]",                    "Voir les invitations d'un membre"),
+            ("statistic",           "[@membre]",                    "Stats messages & temps vocal d'un membre"),
             ("autorole",            "<rôle>",                    "Auto-rôle à l'arrivée"),
             ("setwelcome",          "<salon> <message>",         "Message de bienvenue"),
             ("addrole",             "<membre> <rôle>",           "Donner un rôle"),
@@ -3970,6 +3997,104 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
 
     else:
         await ctx.reply(f"❌ Sous-commande inconnue. Tape `{PREFIX}help automod` pour l'aide.")
+
+# ─────────────────────────────────────────
+#  INVITATIONS & STATISTIQUES MEMBRES
+# ─────────────────────────────────────────
+@bot.command(name="invites")
+async def invites_cmd(ctx, member: discord.Member = None):
+    """Afficher le nombre d'invitations d'un membre sur le serveur. Usage : +invites [@membre]"""
+    member = member or ctx.author
+    try:
+        guild_invites = await ctx.guild.invites()
+    except discord.Forbidden:
+        return await ctx.reply("❌ Je n'ai pas la permission de voir les invitations du serveur (`Gérer le serveur` requis).")
+
+    joins   = 0
+    leaves  = 0
+    fake    = 0
+    bonus   = 0
+
+    for inv in guild_invites:
+        if inv.inviter and inv.inviter.id == member.id:
+            uses = inv.uses or 0
+            joins += uses
+
+    # Discord ne fournit pas nativement leaves/fake/bonus via l'API — on affiche
+    # joins (réel) et les 3 autres à 0 (comme la plupart des bots invites).
+    total = joins + bonus - leaves - fake
+
+    e = discord.Embed(
+        title=f"Invites count of 🌐 @{member.display_name}",
+        description=(
+            f"*generated in {round(ctx.bot.latency * 1000)}ms*\n\n"
+            f"✅ **{joins}** joins in total\n"
+            f"❌ **{leaves}** leaves\n"
+            f"💩 **{fake}** fake\n"
+            f"✨ **{bonus}** bonus\n\n"
+            f"This user has currently **{max(total, 0)}** invites ! 👋"
+        ),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.set_footer(text=f"Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="statistic")
+async def statistic_cmd(ctx, member: discord.Member = None):
+    """Afficher les statistiques de messages et de temps vocal d'un membre. Usage : +statistic [@membre]"""
+    member = member or ctx.author
+    stats  = _member_stats[ctx.guild.id][member.id]
+
+    # Temps vocal : accumulé + session en cours (si actuellement connecté)
+    voice_seconds = stats["voice_seconds"]
+    if stats["voice_joined"] is not None:
+        voice_seconds += time.time() - stats["voice_joined"]
+
+    msg_count = stats["messages"]
+
+    # Formatage du temps vocal
+    total_s = int(voice_seconds)
+    hours   = total_s // 3600
+    minutes = (total_s % 3600) // 60
+    seconds = total_s % 60
+    if hours > 0:
+        voice_str = f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        voice_str = f"{minutes}m {seconds}s"
+    else:
+        voice_str = f"{seconds}s"
+
+    # Salon vocal actuel (le cas échéant)
+    voice_channel = member.voice.channel if member.voice else None
+
+    e = discord.Embed(
+        title=f"📊 Statistiques de {member.display_name}",
+        color=member.color or discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(
+        name="💬 Messages",
+        value=f"**{msg_count}** message(s) envoyé(s)\n*(depuis le dernier démarrage du bot)*",
+        inline=False
+    )
+    e.add_field(
+        name="🔊 Temps en vocal",
+        value=(
+            f"**{voice_str}**\n"
+            f"*(depuis le dernier démarrage du bot)*\n"
+            + (f"📍 Actuellement dans {voice_channel.mention}" if voice_channel else "📴 Pas en vocal")
+        ),
+        inline=False
+    )
+    e.add_field(name="📅 A rejoint le serveur", value=f"<t:{int(member.joined_at.timestamp())}:R>" if member.joined_at else "Inconnu", inline=True)
+    e.add_field(name="🏷️ Compte créé le",      value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+    e.set_footer(text=f"Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
+    await ctx.send(embed=e)
+
 
 # ─────────────────────────────────────────
 #  Lancement avec reconnexion automatique
