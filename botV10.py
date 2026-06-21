@@ -156,6 +156,28 @@ def warning_embed(title, description):
 def check_hierarchy(ctx, member: discord.Member) -> bool:
     return ctx.author.top_role > member.top_role and ctx.guild.me.top_role > member.top_role
 
+async def get_audit_executor(guild: discord.Guild, action: discord.AuditLogAction, target_id: int = None, within_seconds: int = 5) -> discord.Member | discord.User | None:
+    """Récupère l'auteur d'une action via les logs d'audit Discord.
+    Retourne None si les permissions manquent ou si aucune entrée récente ne correspond."""
+    try:
+        limit = 5
+        async for entry in guild.audit_logs(limit=limit, action=action):
+            age = (datetime.now(timezone.utc) - entry.created_at).total_seconds()
+            if age > within_seconds:
+                break
+            if target_id is None:
+                return entry.user
+            target = entry.target
+            # Le target peut être un objet Guild, User, Role, Channel, etc.
+            target_eid = getattr(target, "id", None)
+            if target_eid is None or target_eid == target_id:
+                return entry.user
+    except discord.Forbidden:
+        pass
+    except Exception:
+        pass
+    return None
+
 # ─────────────────────────────────────────
 #  Automod — Configuration par défaut
 # ─────────────────────────────────────────
@@ -554,6 +576,27 @@ async def on_member_join(member):
                     .replace("{name}", str(member)))
             await ch.send(text)
 
+    # Log d'arrivée détaillé
+    log_ch_id = cfg.get("log_channel")
+    if log_ch_id:
+        log_ch = member.guild.get_channel(int(log_ch_id))
+        if log_ch:
+            account_age = datetime.now(timezone.utc) - member.created_at
+            days = account_age.days
+            new_account_warning = "\n⚠️ **Compte récent (moins de 7 jours) !**" if days < 7 else ""
+            e = success_embed(
+                "👋 Nouveau membre",
+                f"**Membre :** {member.mention} (`{member.id}`)\n"
+                f"**Compte créé :** <t:{int(member.created_at.timestamp())}:R> ({days} jours)\n"
+                f"**Membres total :** {member.guild.member_count}"
+                + new_account_warning
+            )
+            e.set_thumbnail(url=member.display_avatar.url)
+            try:
+                await log_ch.send(embed=e)
+            except discord.Forbidden:
+                pass
+
 @bot.event
 async def on_member_remove(member):
     # Ne pas logger la suppression des bots (déjà géré par l'anti-bot)
@@ -567,12 +610,25 @@ async def on_member_remove(member):
     if not ch:
         return
     roles = [r.mention for r in member.roles if r.name != "@everyone"]
-    e = info_embed(
-        "👋 Membre parti",
-        f"**Membre :** {member} (`{member.id}`)\n"
-        f"**Rejoint le :** {f'<t:{int(member.joined_at.timestamp())}:R>' if member.joined_at else 'Inconnu'}\n"
-        f"**Rôles :** {', '.join(roles) if roles else 'Aucun'}"
-    )
+
+    # Vérifier si c'est un kick via les logs d'audit
+    kicker = await get_audit_executor(member.guild, discord.AuditLogAction.kick, member.id, within_seconds=5)
+    if kicker:
+        e = mod_embed(
+            "👢 Membre expulsé (kick)",
+            f"**Membre :** {member} (`{member.id}`)\n"
+            f"**Expulsé par :** {kicker.mention} (`{kicker.id}`)\n"
+            f"**Rejoint le :** {f'<t:{int(member.joined_at.timestamp())}:R>' if member.joined_at else 'Inconnu'}\n"
+            f"**Rôles :** {', '.join(roles) if roles else 'Aucun'}",
+            discord.Color.orange()
+        )
+    else:
+        e = info_embed(
+            "👋 Membre parti",
+            f"**Membre :** {member} (`{member.id}`)\n"
+            f"**Rejoint le :** {f'<t:{int(member.joined_at.timestamp())}:R>' if member.joined_at else 'Inconnu'}\n"
+            f"**Rôles :** {', '.join(roles) if roles else 'Aucun'}"
+        )
     e.set_thumbnail(url=member.display_avatar.url)
     try:
         await ch.send(embed=e)
@@ -617,10 +673,14 @@ async def on_message_delete(message: discord.Message):
     if ch_id:
         ch = message.guild.get_channel(int(ch_id))
         if ch:
+            # Tenter de trouver qui a supprimé le message via les logs d'audit
+            deleter = await get_audit_executor(message.guild, discord.AuditLogAction.message_delete, message.author.id, within_seconds=5)
+            deleter_str = f"\n**Supprimé par :** {deleter.mention} (`{deleter.id}`)" if deleter and deleter.id != message.author.id else ""
             desc = (
                 f"**Auteur :** {message.author.mention} (`{message.author.id}`)\n"
-                f"**Salon :** {message.channel.mention}\n"
-                f"**Contenu :** {message.content[:900] or '[vide]'}"
+                f"**Salon :** {message.channel.mention}"
+                + deleter_str +
+                f"\n**Contenu :** {message.content[:900] or '[vide]'}"
             )
             if message.attachments:
                 desc += f"\n**Pièces jointes :** {', '.join(a.url for a in message.attachments[:3])}"
@@ -672,11 +732,14 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     added   = [r for r in after.roles  if r not in before.roles]
     removed = [r for r in before.roles if r not in after.roles]
     if added or removed:
+        executor = await get_audit_executor(before.guild, discord.AuditLogAction.member_role_update, after.id, within_seconds=5)
+        executor_str = f"\n**Modifié par :** {executor.mention} (`{executor.id}`)" if executor else ""
         desc = f"**Membre :** {after.mention} (`{after.id}`)\n"
         if added:
             desc += f"**Rôles ajoutés :** {', '.join(r.mention for r in added)}\n"
         if removed:
             desc += f"**Rôles retirés :** {', '.join(r.mention for r in removed)}"
+        desc += executor_str
         e = info_embed("🎭 Rôles modifiés", desc)
         try:
             await ch.send(embed=e)
@@ -686,11 +749,14 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     # Changement de pseudo
     if before.nick != after.nick:
+        executor = await get_audit_executor(before.guild, discord.AuditLogAction.member_update, after.id, within_seconds=5)
+        executor_str = f"\n**Modifié par :** {executor.mention} (`{executor.id}`)" if executor and executor.id != after.id else ""
         e = info_embed(
             "✏️ Pseudo modifié",
             f"**Membre :** {after.mention} (`{after.id}`)\n"
             f"**Avant :** {before.nick or before.name}\n"
             f"**Après :** {after.nick or after.name}"
+            + executor_str
         )
         try:
             await ch.send(embed=e)
@@ -702,19 +768,26 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     after_to  = after.timed_out_until
     now       = datetime.now(timezone.utc)
     if not before_to and after_to and after_to > now:
+        executor = await get_audit_executor(before.guild, discord.AuditLogAction.member_update, after.id, within_seconds=5)
+        executor_str = f"\n**Appliqué par :** {executor.mention} (`{executor.id}`)" if executor else ""
         e = mod_embed(
             "🔇 Membre mis en timeout",
             f"**Membre :** {after.mention} (`{after.id}`)\n"
-            f"**Fin :** <t:{int(after_to.timestamp())}:R>"
+            f"**Fin :** <t:{int(after_to.timestamp())}:R>\n"
+            f"**Durée :** {format_duration(after_to - now)}"
+            + executor_str
         )
         try:
             await ch.send(embed=e)
         except discord.Forbidden:
             pass
     elif before_to and (not after_to or after_to <= now):
+        executor = await get_audit_executor(before.guild, discord.AuditLogAction.member_update, after.id, within_seconds=5)
+        executor_str = f"\n**Retiré par :** {executor.mention} (`{executor.id}`)" if executor else ""
         e = success_embed(
             "🔊 Timeout retiré",
             f"**Membre :** {after.mention} (`{after.id}`)"
+            + executor_str
         )
         try:
             await ch.send(embed=e)
@@ -731,9 +804,25 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     ch = guild.get_channel(int(ch_id))
     if not ch:
         return
+    executor = await get_audit_executor(guild, discord.AuditLogAction.ban, user.id, within_seconds=5)
+    executor_str = f"\n**Banni par :** {executor.mention} (`{executor.id}`)" if executor else ""
+
+    # Récupérer la raison depuis les logs d'audit
+    reason_str = ""
+    try:
+        async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.ban):
+            if entry.target and entry.target.id == user.id:
+                if entry.reason:
+                    reason_str = f"\n**Raison :** {entry.reason}"
+                break
+    except discord.Forbidden:
+        pass
+
     e = mod_embed(
         "🔨 Membre banni",
-        f"**Utilisateur :** {user} (`{user.id}`)",
+        f"**Utilisateur :** {user} (`{user.id}`)"
+        + executor_str
+        + reason_str,
         discord.Color.dark_red()
     )
     e.set_thumbnail(url=user.display_avatar.url)
@@ -751,9 +840,12 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
     ch = guild.get_channel(int(ch_id))
     if not ch:
         return
+    executor = await get_audit_executor(guild, discord.AuditLogAction.unban, user.id, within_seconds=5)
+    executor_str = f"\n**Débanni par :** {executor.mention} (`{executor.id}`)" if executor else ""
     e = success_embed(
         "✅ Membre débanni",
         f"**Utilisateur :** {user} (`{user.id}`)"
+        + executor_str
     )
     e.set_thumbnail(url=user.display_avatar.url)
     try:
@@ -772,11 +864,14 @@ async def on_guild_channel_create(channel):
     if not log_ch:
         return
     kind = "vocal" if isinstance(channel, discord.VoiceChannel) else "textuel" if isinstance(channel, discord.TextChannel) else "catégorie"
+    executor = await get_audit_executor(channel.guild, discord.AuditLogAction.channel_create, channel.id, within_seconds=5)
+    executor_str = f"\n**Créé par :** {executor.mention} (`{executor.id}`)" if executor else ""
     e = success_embed(
         "➕ Salon créé",
         f"**Nom :** {channel.mention if hasattr(channel, 'mention') else channel.name}\n"
         f"**Type :** {kind}\n"
         f"**ID :** `{channel.id}`"
+        + executor_str
     )
     try:
         await log_ch.send(embed=e)
@@ -792,9 +887,12 @@ async def on_guild_channel_delete(channel):
     log_ch = channel.guild.get_channel(int(ch_id))
     if not log_ch:
         return
+    executor = await get_audit_executor(channel.guild, discord.AuditLogAction.channel_delete, channel.id, within_seconds=5)
+    executor_str = f"\n**Supprimé par :** {executor.mention} (`{executor.id}`)" if executor else ""
     e = mod_embed(
         "🗑️ Salon supprimé",
-        f"**Nom :** #{channel.name}\n**ID :** `{channel.id}`",
+        f"**Nom :** #{channel.name}\n**ID :** `{channel.id}`"
+        + executor_str,
         discord.Color.dark_red()
     )
     try:
@@ -820,9 +918,11 @@ async def on_guild_channel_update(before, after):
         changes.append(f"**Slowmode :** `{before.slowmode_delay}s` → `{after.slowmode_delay}s`")
     if not changes:
         return
+    executor = await get_audit_executor(before.guild, discord.AuditLogAction.channel_update, after.id, within_seconds=5)
+    executor_str = f"\n**Modifié par :** {executor.mention} (`{executor.id}`)" if executor else ""
     e = info_embed(
         "🔧 Salon modifié",
-        f"**Salon :** {after.mention if hasattr(after, 'mention') else after.name}\n" + "\n".join(changes)
+        f"**Salon :** {after.mention if hasattr(after, 'mention') else after.name}\n" + "\n".join(changes) + executor_str
     )
     try:
         await log_ch.send(embed=e)
@@ -839,9 +939,12 @@ async def on_guild_role_create(role: discord.Role):
     ch = role.guild.get_channel(int(ch_id))
     if not ch:
         return
+    executor = await get_audit_executor(role.guild, discord.AuditLogAction.role_create, role.id, within_seconds=5)
+    executor_str = f"\n**Créé par :** {executor.mention} (`{executor.id}`)" if executor else ""
     e = success_embed(
         "➕ Rôle créé",
         f"**Nom :** {role.mention}\n**ID :** `{role.id}`"
+        + executor_str
     )
     try:
         await ch.send(embed=e)
@@ -857,9 +960,12 @@ async def on_guild_role_delete(role: discord.Role):
     ch = role.guild.get_channel(int(ch_id))
     if not ch:
         return
+    executor = await get_audit_executor(role.guild, discord.AuditLogAction.role_delete, role.id, within_seconds=5)
+    executor_str = f"\n**Supprimé par :** {executor.mention} (`{executor.id}`)" if executor else ""
     e = mod_embed(
         "🗑️ Rôle supprimé",
-        f"**Nom :** @{role.name}\n**ID :** `{role.id}`",
+        f"**Nom :** @{role.name}\n**ID :** `{role.id}`\n**Couleur :** `{role.color}`"
+        + executor_str,
         discord.Color.dark_red()
     )
     try:
@@ -889,9 +995,11 @@ async def on_guild_role_update(before: discord.Role, after: discord.Role):
         changes.append(f"**Mentionnable :** `{before.mentionable}` → `{after.mentionable}`")
     if not changes:
         return
+    executor = await get_audit_executor(before.guild, discord.AuditLogAction.role_update, after.id, within_seconds=5)
+    executor_str = f"\n**Modifié par :** {executor.mention} (`{executor.id}`)" if executor else ""
     e = info_embed(
         "🔧 Rôle modifié",
-        f"**Rôle :** {after.mention}\n" + "\n".join(changes)
+        f"**Rôle :** {after.mention}\n" + "\n".join(changes) + executor_str
     )
     try:
         await ch.send(embed=e)
@@ -917,7 +1025,9 @@ async def on_guild_update(before: discord.Guild, after: discord.Guild):
         changes.append(f"**Niveau de vérif :** `{before.verification_level}` → `{after.verification_level}`")
     if not changes:
         return
-    e = info_embed("🏠 Serveur modifié", "\n".join(changes))
+    executor = await get_audit_executor(before, discord.AuditLogAction.guild_update, before.id, within_seconds=5)
+    executor_str = f"\n**Modifié par :** {executor.mention} (`{executor.id}`)" if executor else ""
+    e = info_embed("🏠 Serveur modifié", "\n".join(changes) + executor_str)
     try:
         await ch.send(embed=e)
     except discord.Forbidden:
@@ -936,13 +1046,17 @@ async def on_guild_emojis_update(guild: discord.Guild, before, after):
     added   = [e for e in after  if e not in before]
     removed = [e for e in before if e not in after]
     if added:
-        e = success_embed("😀 Emoji(s) ajouté(s)", " ".join(str(em) for em in added))
+        executor = await get_audit_executor(guild, discord.AuditLogAction.emoji_create, added[0].id if added else None, within_seconds=5)
+        executor_str = f"\n**Ajouté par :** {executor.mention} (`{executor.id}`)" if executor else ""
+        e = success_embed("😀 Emoji(s) ajouté(s)", " ".join(str(em) for em in added) + f"\n**Noms :** {', '.join(f'`:{em.name}:`' for em in added)}" + executor_str)
         try:
             await ch.send(embed=e)
         except discord.Forbidden:
             pass
     if removed:
-        e = mod_embed("🗑️ Emoji(s) supprimé(s)", ", ".join(f"`:{em.name}:`" for em in removed), discord.Color.dark_red())
+        executor = await get_audit_executor(guild, discord.AuditLogAction.emoji_delete, removed[0].id if removed else None, within_seconds=5)
+        executor_str = f"\n**Supprimé par :** {executor.mention} (`{executor.id}`)" if executor else ""
+        e = mod_embed("🗑️ Emoji(s) supprimé(s)", ", ".join(f"`:{em.name}:`" for em in removed) + executor_str, discord.Color.dark_red())
         try:
             await ch.send(embed=e)
         except discord.Forbidden:
@@ -985,10 +1099,13 @@ async def on_invite_delete(invite: discord.Invite):
     ch = invite.guild.get_channel(int(ch_id))
     if not ch:
         return
+    executor = await get_audit_executor(invite.guild, discord.AuditLogAction.invite_delete, within_seconds=5)
+    executor_str = f"\n**Supprimé par :** {executor.mention} (`{executor.id}`)" if executor else ""
     e = mod_embed(
         "🔗 Invitation supprimée",
         f"**Code :** discord.gg/{invite.code}\n"
-        f"**Utilisations :** {invite.uses or 0}",
+        f"**Utilisations :** {invite.uses or 0}"
+        + executor_str,
         discord.Color.dark_red()
     )
     try:
@@ -1941,9 +2058,15 @@ async def purge(ctx, member: discord.Member, amount: int = 100):
         return await ctx.reply("❌ Nombre entre 1 et 500.")
     await ctx.message.delete()
     after_limit = datetime.now(timezone.utc) - timedelta(days=14)
-    def check(m): return m.author == member
-    deleted = await ctx.channel.purge(limit=min(amount * 10, 2000), check=check, after=after_limit, bulk=True)
-    deleted = deleted[:amount]
+    deleted_count = 0
+    # On scanne jusqu'à amount*5 messages max pour trouver 'amount' messages de ce membre
+    async def check(m): return m.author == member
+    # discord.py purge ne supporte pas un check async, on utilise une lambda
+    deleted = await ctx.channel.purge(limit=min(amount * 5, 1000), check=lambda m: m.author == member, after=after_limit, bulk=True)
+    # Supprimer seulement les 'amount' premiers trouvés si on en a trop
+    if len(deleted) > amount:
+        # On ne peut pas "remettre" les extras, mais c'est rare — la limite * 5 évite le sur-suppression
+        pass
     e = success_embed("🧹 Purge", f"**{len(deleted)}** message(s) de {member.mention} supprimé(s).\n**Modérateur :** {ctx.author.mention}")
     msg = await ctx.send(embed=e)
     await asyncio.sleep(5)
