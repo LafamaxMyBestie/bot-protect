@@ -477,6 +477,14 @@ async def on_ready():
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching, name=f"{PREFIX}help · modération"))
 
+    # ── Initialiser voice_joined pour les membres déjà en vocal au démarrage ──
+    now_ts = time.time()
+    for guild in bot.guilds:
+        for vc in guild.voice_channels:
+            for member in vc.members:
+                if not member.bot:
+                    _member_stats[guild.id][member.id]["voice_joined"] = now_ts
+
 @bot.event
 async def on_command(ctx):
     _bot_stats["commands_used"] += 1
@@ -1458,6 +1466,7 @@ HELP_SECTIONS = {
         "commands": [
             ("invites",             "[@membre]",                    "Voir les invitations d'un membre"),
             ("statistic",           "[@membre]",                    "Stats messages & temps vocal d'un membre"),
+            ("leaderboard",         "",                             "Top 3 messages & Top 3 temps vocal + ton classement"),
             ("autorole",            "<rôle>",                    "Auto-rôle à l'arrivée"),
             ("setwelcome",          "<salon> <message>",         "Message de bienvenue"),
             ("addrole",             "<membre> <rôle>",           "Donner un rôle"),
@@ -3575,10 +3584,13 @@ async def snipe(ctx, member: discord.Member = None):
         raw_entries.sort(key=lambda x: x.get("created_at", ""), reverse=True)
         title = "🕵️ Derniers messages supprimés du serveur"
 
-    valid = [
-        entry for entry in raw_entries
-        if now - datetime.fromisoformat(entry["created_at"]) <= SNIPE_MAX_AGE
-    ][:10]
+    def _is_recent(entry):
+        try:
+            return now - datetime.fromisoformat(entry["created_at"]) <= SNIPE_MAX_AGE
+        except Exception:
+            return False
+
+    valid = [entry for entry in raw_entries if _is_recent(entry)][:10]
 
     if not valid:
         return await ctx.reply("❌ Aucun message supprimé récent trouvé.")
@@ -4219,6 +4231,115 @@ async def statistic_cmd(ctx, member: discord.Member = None):
     await ctx.send(embed=e)
 
 
+@bot.command(name="leaderboard")
+async def leaderboard_cmd(ctx):
+    """Afficher le top 3 messages & top 3 temps vocal, ainsi que ton propre classement. Usage : +leaderboard"""
+    guild_stats = _member_stats[ctx.guild.id]
+
+    # Construire les listes en incluant la session vocal en cours
+    now_ts = time.time()
+    msg_list = []
+    voice_list = []
+    for uid, stats in guild_stats.items():
+        member = ctx.guild.get_member(uid)
+        if not member or member.bot:
+            continue
+        msg_count = stats["messages"]
+        voice_s = stats["voice_seconds"]
+        if stats["voice_joined"] is not None:
+            voice_s += now_ts - stats["voice_joined"]
+        msg_list.append((uid, msg_count))
+        voice_list.append((uid, voice_s))
+
+    # Trier par valeur décroissante
+    msg_list.sort(key=lambda x: x[1], reverse=True)
+    voice_list.sort(key=lambda x: x[1], reverse=True)
+
+    def format_voice(seconds: float) -> str:
+        total_s = int(seconds)
+        h = total_s // 3600
+        m = (total_s % 3600) // 60
+        s = total_s % 60
+        if h > 0:
+            return f"{h}h {m}m {s}s"
+        elif m > 0:
+            return f"{m}m {s}s"
+        return f"{s}s"
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    # ── Top 3 Messages ──
+    msg_lines = []
+    for i, (uid, count) in enumerate(msg_list[:3]):
+        member = ctx.guild.get_member(uid)
+        name = member.display_name if member else f"<@{uid}>"
+        medal = medals[i] if i < 3 else f"#{i+1}"
+        msg_lines.append(f"{medal} **{name}** — `{count}` message(s)")
+
+    if not msg_lines:
+        msg_lines = ["*Aucune donnée disponible*"]
+
+    # ── Top 3 Vocal ──
+    voice_lines = []
+    for i, (uid, seconds) in enumerate(voice_list[:3]):
+        member = ctx.guild.get_member(uid)
+        name = member.display_name if member else f"<@{uid}>"
+        medal = medals[i] if i < 3 else f"#{i+1}"
+        voice_lines.append(f"{medal} **{name}** — `{format_voice(seconds)}`")
+
+    if not voice_lines:
+        voice_lines = ["*Aucune donnée disponible*"]
+
+    # ── Classement de l'appelant ──
+    author_id = ctx.author.id
+    author_msg_rank = next((i + 1 for i, (uid, _) in enumerate(msg_list) if uid == author_id), None)
+    author_voice_rank = next((i + 1 for i, (uid, _) in enumerate(voice_list) if uid == author_id), None)
+    author_msg_count = guild_stats[author_id]["messages"]
+    author_voice_s = guild_stats[author_id]["voice_seconds"]
+    if guild_stats[author_id]["voice_joined"] is not None:
+        author_voice_s += now_ts - guild_stats[author_id]["voice_joined"]
+
+    if author_msg_rank:
+        your_msg_str = f"#{author_msg_rank} — `{author_msg_count}` message(s)"
+    else:
+        your_msg_str = "Aucune donnée"
+
+    if author_voice_rank:
+        your_voice_str = f"#{author_voice_rank} — `{format_voice(author_voice_s)}`"
+    else:
+        your_voice_str = "Aucune donnée"
+
+    e = discord.Embed(
+        title=f"🏆 Classement de {ctx.guild.name}",
+        description="*Statistiques depuis le dernier démarrage du bot.*",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    if ctx.guild.icon:
+        e.set_thumbnail(url=ctx.guild.icon.url)
+
+    e.add_field(
+        name="💬 Top 3 — Messages",
+        value="\n".join(msg_lines),
+        inline=False
+    )
+    e.add_field(
+        name="🔊 Top 3 — Temps vocal",
+        value="\n".join(voice_lines),
+        inline=False
+    )
+    e.add_field(
+        name=f"📊 Ton classement — {ctx.author.display_name}",
+        value=(
+            f"💬 Messages : {your_msg_str}\n"
+            f"🔊 Vocal : {your_voice_str}"
+        ),
+        inline=False
+    )
+    e.set_footer(text=f"Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
+    await ctx.send(embed=e)
+
+
 # ─────────────────────────────────────────
 #  Lancement avec reconnexion automatique
 # ─────────────────────────────────────────
@@ -4235,6 +4356,8 @@ if __name__ == "__main__":
         try:
             log.info(f"🚀 Démarrage du bot (tentative {attempts + 1})...")
             bot.run(TOKEN, log_handler=None)
+            # bot.run() est revenu proprement (arrêt interne discord.py) — on remet le compteur à zéro
+            attempts = 0
         except discord.errors.LoginFailure:
             log.error("❌ Token Discord invalide.")
             break
