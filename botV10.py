@@ -36,46 +36,6 @@ intents.voice_states = True  # déjà inclus par default(), explicite ici pour l
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 # ─────────────────────────────────────────
-#  Application Emojis (custom)
-# ─────────────────────────────────────────
-# Statuts
-E_ONLINE      = "<:statusonline:1518909541880827944>"
-E_OFFLINE     = "<:statusoffline:1518909530946273281>"
-E_DEACTIVATED = "<:deactivated:1518909532321874010>"
-E_ACTIVE      = "<:activebutton:1518909534385606857>"
-# UI / Navigation
-E_ARROW       = "<:pinkrightarrowbounce:1518909535392108636>"
-E_LOCKED      = "<:locked:1518909523191005184>"
-E_CHECKMARK   = "<:checkmark:1518909521483796490>"
-E_XMARK       = "<:xmark:1518909499354775652>"
-E_MESSAGE     = "<:message:1518909524797292554>"
-E_MICROPHONE  = "<:microphone:1518909525845872780>"
-E_SPEAKER     = "<:speaker:1518909509978951700>"
-E_PC          = "<:pc:1518909511052824787>"
-E_FILES       = "<:files:1518909536310661191>"
-E_TICKET      = "<:ticket:1518909527758475315>"
-E_BROOM       = "<:broom:1518909543009226783>"
-# Rôles / Staff / Badges
-E_BOTS        = "<:bots:1518909538051293254>"
-E_STAFF       = "<:staffbadgeorange:1518909526705700905>"
-E_NITRO       = "<:nitrobooster:1518909533424975992>"
-# Fun / Déco
-E_SPARKLES    = "<:simplesparkles:1518909540077277357>"
-E_CATWAVE     = "<:catwave:1518909528933142548>"
-E_TADACOM     = "<:tadacom:1518909495806529566>"
-E_SCUBBACAT   = "<:scubbacat:1518909496972541992>"
-E_GEARZ       = "<:gearz:1518909498008277113>"
-E_MEMBRES     = "<:membres:1518909500365475900>"
-# Trophées / Classement
-E_TROPHY1     = "<:firstplacetrophy:1518909512420032703>"
-E_TROPHY2     = "<:secondplacetrophy:1518909505793032282>"
-E_TROPHY3     = "<:thirdplacetrophy:1518909502227746816>"
-E_TROPHY_FIX  = "<:trophyfixed:1518909503670849568>"
-# Boucliers / Protection
-E_SHIELD_BLUE = "<:blue:1518909509035102279>"
-E_SHIELD_DARK = "<:darkblue:1518909507575615638>"
-
-# ─────────────────────────────────────────
 #  Persistance (fichiers JSON)
 # ─────────────────────────────────────────
 WARNS_FILE       = "warns.json"
@@ -317,7 +277,7 @@ async def automod_action(message: discord.Message, reason: str, am_cfg: dict):
 
     try:
         await message.channel.send(
-            embed=warning_embed(f"{E_SHIELD_BLUE} AutoMod", f"{member.mention} — {reason}"),
+            embed=warning_embed("🤖 AutoMod", f"{member.mention} — {reason}"),
             delete_after=6
         )
     except discord.Forbidden:
@@ -357,7 +317,7 @@ async def automod_action(message: discord.Message, reason: str, am_cfg: dict):
 
     if am_cfg.get("log_automod", True):
         e = mod_embed(
-            f"{E_SHIELD_BLUE} AutoMod — Infraction",
+            "🤖 AutoMod — Infraction",
             f"**Membre :** {member.mention} (`{member.id}`)\n"
             f"**Raison :** {reason}\n"
             f"**Action :** {action}\n"
@@ -431,7 +391,7 @@ async def apply_warn_milestones(guild: discord.Guild, member: discord.Member, co
     if count == 5:
         try:
             await member.send(embed=mod_embed(
-                f"{E_XMARK} Tu as été blacklist (bl)",
+                "⛔ Tu as été blacklist (bl)",
                 f"**Serveur :** {guild.name}\n**Raison :** {reason}"
             ))
         except Exception:
@@ -442,7 +402,7 @@ async def apply_warn_milestones(guild: discord.Guild, member: discord.Member, co
             pass
         else:
             e = mod_embed(
-                f"{E_XMARK} Blacklist automatique (5 warns)",
+                "⛔ Blacklist automatique (5 warns)",
                 f"**Membre :** {member.mention} (`{member.id}`)\n"
                 f"**Warns :** {count}\n"
                 f"**Action :** Blacklist (bl) définitive",
@@ -455,7 +415,7 @@ async def apply_warn_milestones(guild: discord.Guild, member: discord.Member, co
         until = datetime.now(timezone.utc) + delta
         try:
             await member.send(embed=mod_embed(
-                f"{E_DEACTIVATED} Tu as été mute",
+                "🔇 Tu as été mute",
                 f"**Serveur :** {guild.name}\n**Durée :** 1 jour\n**Raison :** {reason}",
                 discord.Color.orange()
             ))
@@ -593,7 +553,7 @@ async def on_member_join(member):
             inviter_info = f"<@{inviter_id}> (`{inviter_id}`)" if inviter_id else "Inconnu"
             kick_status  = "✅ Expulsé" if inviter_kicked else "❌ Non expulsé (permissions insuffisantes)"
             e = mod_embed(
-                f"{E_BOTS} Anti-Bot — Bot + Inviteur expulsés",
+                "🤖 Anti-Bot — Bot + Inviteur expulsés",
                 f"**Bot expulsé :** {member} (`{member.id}`)\n"
                 f"**Ajouté par :** {inviter_info}\n"
                 f"**Inviteur expulsé :** {kick_status}\n"
@@ -633,7 +593,7 @@ async def on_member_join(member):
             days = account_age.days
             new_account_warning = "\n⚠️ **Compte récent (moins de 7 jours) !**" if days < 7 else ""
             e = success_embed(
-                f"{E_CATWAVE} Nouveau membre",
+                "👋 Nouveau membre",
                 f"**Membre :** {member.mention} (`{member.id}`)\n"
                 f"**Compte créé :** <t:{int(member.created_at.timestamp())}:R> ({days} jours)\n"
                 f"**Membres total :** {member.guild.member_count}"
@@ -1192,20 +1152,20 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     if not before.channel and after.channel:
         e = success_embed(
-            f"{E_SPEAKER} Salon vocal — Connexion",
+            "🔊 Salon vocal — Connexion",
             f"**Membre :** {member.mention} (`{member.id}`)\n"
             f"**Salon :** {after.channel.mention}"
         )
     elif before.channel and not after.channel:
         e = mod_embed(
-            f"{E_DEACTIVATED} Salon vocal — Déconnexion",
+            "🔇 Salon vocal — Déconnexion",
             f"**Membre :** {member.mention} (`{member.id}`)\n"
             f"**Salon quitté :** {before.channel.mention}",
             discord.Color.dark_gray()
         )
     elif before.channel and after.channel and before.channel != after.channel:
         e = info_embed(
-            f"{E_ARROW} Salon vocal — Déplacement",
+            "🔀 Salon vocal — Déplacement",
             f"**Membre :** {member.mention} (`{member.id}`)\n"
             f"**Avant :** {before.channel.mention} → **Après :** {after.channel.mention}"
         )
@@ -1557,7 +1517,7 @@ HELP_PAGE_SIZE = 6  # commandes max par page
 
 def build_home_embed(author: discord.User) -> discord.Embed:
     e = discord.Embed(
-        title=f"{E_BOTS} Aide — Menu principal",
+        title="🤖 Aide — Menu principal",
         description=(
             f"Préfixe : **`{PREFIX}`**\n\n"
             "Sélectionne une catégorie dans le menu ci-dessous pour voir les commandes.\n"
@@ -1874,7 +1834,7 @@ async def kick(ctx, member: discord.Member, *, reason: str = "Aucune raison four
     except Exception:
         pass
     await member.kick(reason=f"{ctx.author} : {reason}")
-    e = mod_embed(f"{E_BROOM} Membre expulsé", f"**Cible :** {member.mention} (`{member.id}`)\n**Modérateur :** {ctx.author.mention}\n**Raison :** {reason}", discord.Color.orange())
+    e = mod_embed("👢 Membre expulsé", f"**Cible :** {member.mention} (`{member.id}`)\n**Modérateur :** {ctx.author.mention}\n**Raison :** {reason}", discord.Color.orange())
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
@@ -1893,7 +1853,7 @@ async def mute(ctx, member: discord.Member, duration: str, *, reason: str = "Auc
     until = datetime.now(timezone.utc) + delta
     await member.timeout(until, reason=f"{ctx.author} : {reason}")
     e = mod_embed(
-        f"{E_DEACTIVATED} Membre muet",
+        "🔇 Membre muet",
         f"**Cible :** {member.mention} (`{member.id}`)\n**Durée :** {duration}\n**Fin :** <t:{int(until.timestamp())}:R>\n**Modérateur :** {ctx.author.mention}\n**Raison :** {reason}",
         discord.Color.orange()
     )
@@ -1906,7 +1866,7 @@ async def mute(ctx, member: discord.Member, duration: str, *, reason: str = "Auc
 async def unmute(ctx, member: discord.Member, *, reason: str = "Aucune raison fournie"):
     """Retirer le mute d'un membre."""
     await member.timeout(None, reason=f"{ctx.author} : {reason}")
-    e = success_embed(f"{E_ACTIVE} Mute retiré", f"**Cible :** {member.mention}\n**Modérateur :** {ctx.author.mention}\n**Raison :** {reason}")
+    e = success_embed("🔊 Mute retiré", f"**Cible :** {member.mention}\n**Modérateur :** {ctx.author.mention}\n**Raison :** {reason}")
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
@@ -1922,11 +1882,11 @@ async def warn(ctx, member: discord.Member, *, reason: str):
     warns_db[gid][uid].append(entry)
     save_warns()
     count = len(warns_db[gid][uid])
-    e = warning_embed(f"{E_XMARK} Avertissement", f"**Cible :** {member.mention} (`{member.id}`)\n**Raison :** {reason}\n**Total warns :** {count}\n**Modérateur :** {ctx.author.mention}")
+    e = warning_embed("⚠️ Avertissement", f"**Cible :** {member.mention} (`{member.id}`)\n**Raison :** {reason}\n**Total warns :** {count}\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
     try:
-        await member.send(embed=warning_embed(f"{E_XMARK} Tu as reçu un avertissement", f"**Serveur :** {ctx.guild.name}\n**Raison :** {reason}\n**Total :** {count} warn(s)"))
+        await member.send(embed=warning_embed("⚠️ Tu as reçu un avertissement", f"**Serveur :** {ctx.guild.name}\n**Raison :** {reason}\n**Total :** {count} warn(s)"))
     except Exception:
         pass
     # Paliers fixes : 3 warns = mute 1j, 5 warns = bl
@@ -1958,7 +1918,7 @@ async def clearwarns(ctx, member: discord.Member):
         return await ctx.reply(f"✅ {member.mention} n'a aucun avertissement.")
     warns_db.setdefault(gid, {})[uid] = []
     save_warns()
-    e = success_embed(f"{E_BROOM} Warns effacés", f"**{count}** avertissement(s) supprimé(s) pour {member.mention}\n**Modérateur :** {ctx.author.mention}")
+    e = success_embed("🧹 Warns effacés", f"**{count}** avertissement(s) supprimé(s) pour {member.mention}\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1969,7 +1929,7 @@ async def warns(ctx, member: discord.Member = None):
     w_list = warns_db.get(gid, {}).get(uid, [])
     if not w_list:
         return await ctx.reply(f"✅ {member.mention} n'a aucun avertissement.")
-    e = warning_embed(f"{E_XMARK} Warns de {member}", "")
+    e = warning_embed(f"⚠️ Warns de {member}", "")
     for i, w in enumerate(w_list, 1):
         ts     = w.get("date", "?")[:10]
         mod_id = w.get("mod")
@@ -2868,7 +2828,7 @@ class TicketManageView(discord.ui.View):
             return await interaction.response.send_message("❌ Tu n'as pas la permission de retirer un membre.", ephemeral=True)
         await interaction.response.send_modal(TicketMemberModal("remove"))
 
-    @discord.ui.button(label="Fermer", style=discord.ButtonStyle.danger, custom_id="ticket_close")
+    @discord.ui.button(label="Fermer", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="ticket_close")
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         tdata, ttype = get_open_ticket(interaction.guild.id, interaction.channel.id)
         if tdata is None:
@@ -3202,10 +3162,10 @@ async def ticketpanel(ctx, channel: discord.TextChannel, *, contenu: str = None)
 
     if contenu:
         parts = contenu.split("|", 1)
-        titre = parts[0].strip() or f"{E_TICKET} Support"
+        titre = parts[0].strip() or "🎫 Support"
         description = parts[1].strip() if len(parts) > 1 else "Clique sur un bouton ci-dessous pour ouvrir un ticket."
     else:
-        titre = f"{E_TICKET} Support"
+        titre = "🎫 Support"
         description = "Clique sur un bouton ci-dessous pour ouvrir un ticket."
 
     type_ids = list(tcfg["types"].keys())[:25]
@@ -3452,28 +3412,28 @@ async def botinfo(ctx):
     total_commands = len(list(bot.commands))
 
     e = discord.Embed(
-        title=f"{E_BOTS} {bot.user.name} — Informations",
+        title=f"🤖 {bot.user.name} — Informations",
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc)
     )
     if bot.user.avatar:
         e.set_thumbnail(url=bot.user.avatar.url)
 
-    e.add_field(name=f"{E_SPARKLES} Nom",       value=str(bot.user),               inline=True)
-    e.add_field(name="🔢 ID",                   value=str(bot.user.id),            inline=True)
-    e.add_field(name=f"{E_MEMBRES} Serveurs",   value=str(len(bot.guilds)),        inline=True)
-    e.add_field(name=f"{E_MEMBRES} Membres",    value=str(total_members),          inline=True)
-    e.add_field(name=f"{E_GEARZ} Commandes",    value=str(total_commands),         inline=True)
-    e.add_field(name="🏓 Latence",              value=f"{round(bot.latency*1000)}ms", inline=True)
-    e.add_field(name="⏱️ Uptime",               value=uptime_str,                   inline=True)
-    e.add_field(name="🚀 Démarré",              value=f"<t:{int(_start_time.timestamp())}:R>", inline=True)
-    e.add_field(name=f"{E_PC} Bibliothèque",    value=f"discord.py {discord.__version__}", inline=True)
-    e.add_field(name="🐍 Python",               value=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}", inline=True)
+    e.add_field(name="🏷️ Nom",         value=str(bot.user),               inline=True)
+    e.add_field(name="🔢 ID",           value=str(bot.user.id),            inline=True)
+    e.add_field(name="🌐 Serveurs",     value=str(len(bot.guilds)),         inline=True)
+    e.add_field(name="👥 Membres",      value=str(total_members),           inline=True)
+    e.add_field(name="⚙️ Commandes",    value=str(total_commands),          inline=True)
+    e.add_field(name="🏓 Latence",      value=f"{round(bot.latency*1000)}ms", inline=True)
+    e.add_field(name="⏱️ Uptime",       value=uptime_str,                   inline=True)
+    e.add_field(name="🚀 Démarré",      value=f"<t:{int(_start_time.timestamp())}:R>", inline=True)
+    e.add_field(name="📚 Bibliothèque", value=f"discord.py {discord.__version__}", inline=True)
+    e.add_field(name="🐍 Python",       value=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}", inline=True)
     e.add_field(name="📊 Stats session",
-                value=f"{E_MESSAGE} Commandes : {_bot_stats['commands_used']}\n{E_SHIELD_BLUE} AutoMod : {_bot_stats['automod_actions']}\n{E_MICROPHONE} Messages : {_bot_stats['messages_today']}",
+                value=f"💬 Commandes : {_bot_stats['commands_used']}\n🤖 AutoMod : {_bot_stats['automod_actions']}\n📨 Messages : {_bot_stats['messages_today']}",
                 inline=False)
     e.add_field(name="💾 Données",
-                value=f"{E_XMARK} Warns : {sum(len(v) for gw in warns_db.values() for v in gw.values())}\n{E_SPARKLES} Giveaways : {sum(len(v) for v in giveaway_db.values())}\n💒 Mariages : {len(marriages_db.get(str(ctx.guild.id), {})) // 2}",
+                value=f"⚠️ Warns enregistrés : {sum(len(v) for gw in warns_db.values() for v in gw.values())}\n🎉 Giveaways : {sum(len(v) for v in giveaway_db.values())}\n💒 Mariages : {len(marriages_db.get(str(ctx.guild.id), {})) // 2}",
                 inline=False)
     e.set_footer(text=f"Préfixe : {PREFIX}  •  Demandé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
     await ctx.send(embed=e)
@@ -3485,7 +3445,7 @@ async def ping(ctx):
     color = discord.Color.green() if latency < 100 else discord.Color.orange() if latency < 200 else discord.Color.red()
     e = discord.Embed(title="🏓 Pong !", color=color)
     e.add_field(name="Latence API", value=f"**{latency}ms**", inline=True)
-    e.add_field(name="Statut", value=f"{E_ONLINE} En ligne", inline=True)
+    e.add_field(name="Statut", value="🟢 En ligne", inline=True)
     await ctx.send(embed=e)
 
 @bot.command()
@@ -3717,7 +3677,7 @@ async def addrole(ctx, member: discord.Member, role: discord.Role):
     if role in member.roles:
         return await ctx.reply(f"❌ {member.mention} a déjà {role.mention}.")
     await member.add_roles(role, reason=f"Ajouté par {ctx.author}")
-    e = success_embed(f"{E_CHECKMARK} Rôle ajouté", f"**Membre :** {member.mention}\n**Rôle :** {role.mention}\n**Modérateur :** {ctx.author.mention}")
+    e = success_embed("✅ Rôle ajouté", f"**Membre :** {member.mention}\n**Rôle :** {role.mention}\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
@@ -3729,7 +3689,7 @@ async def removerole(ctx, member: discord.Member, role: discord.Role):
     if role not in member.roles:
         return await ctx.reply(f"❌ {member.mention} n'a pas {role.mention}.")
     await member.remove_roles(role, reason=f"Retiré par {ctx.author}")
-    e = mod_embed(f"{E_XMARK} Rôle retiré", f"**Membre :** {member.mention}\n**Rôle :** {role.mention}\n**Modérateur :** {ctx.author.mention}", discord.Color.orange())
+    e = mod_embed("✅ Rôle retiré", f"**Membre :** {member.mention}\n**Rôle :** {role.mention}\n**Modérateur :** {ctx.author.mention}", discord.Color.orange())
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
@@ -3765,14 +3725,14 @@ async def userinfo(ctx, member: discord.Member = None):
     warn_count = len(warns_db.get(gid, {}).get(uid, []))
     married_to = marriages_db.get(gid, {}).get(uid)
 
-    e = discord.Embed(title=f"{E_MEMBRES} {member}", color=member.color, timestamp=datetime.now(timezone.utc))
+    e = discord.Embed(title=f"👤 {member}", color=member.color, timestamp=datetime.now(timezone.utc))
     e.set_thumbnail(url=member.display_avatar.url)
-    e.add_field(name="ID",                   value=member.id,                                     inline=True)
-    e.add_field(name="Surnom",               value=member.nick or "Aucun",                        inline=True)
-    e.add_field(name=f"{E_BOTS} Bot",        value=f"{E_CHECKMARK}" if member.bot else f"{E_XMARK}", inline=True)
-    e.add_field(name="Compte créé",          value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
-    e.add_field(name="A rejoint",            value=f"<t:{int(member.joined_at.timestamp())}:R>",  inline=True)
-    e.add_field(name=f"{E_XMARK} Warns",    value=str(warn_count),                               inline=True)
+    e.add_field(name="ID",          value=member.id,                                     inline=True)
+    e.add_field(name="Surnom",      value=member.nick or "Aucun",                        inline=True)
+    e.add_field(name="Bot",         value="✅" if member.bot else "❌",                   inline=True)
+    e.add_field(name="Compte créé", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+    e.add_field(name="A rejoint",   value=f"<t:{int(member.joined_at.timestamp())}:R>",  inline=True)
+    e.add_field(name="⚠️ Warns",    value=str(warn_count),                              inline=True)
     if married_to:
         partner = ctx.guild.get_member(int(married_to))
         e.add_field(name="💍 Marié(e) à", value=partner.mention if partner else f"<@{married_to}>", inline=True)
@@ -3793,15 +3753,15 @@ async def serverinfo(ctx):
     e = info_embed(f"🏠 {g.name}", "")
     if g.icon:
         e.set_thumbnail(url=g.icon.url)
-    e.add_field(name="ID",                             value=g.id,                                         inline=True)
-    e.add_field(name="Propriétaire",                   value=g.owner.mention,                              inline=True)
-    e.add_field(name=f"{E_MEMBRES} Membres",           value=g.member_count,                               inline=True)
-    e.add_field(name=f"{E_MESSAGE} Salons texte",      value=len(g.text_channels),                         inline=True)
-    e.add_field(name=f"{E_SPEAKER} Salons vocaux",     value=len(g.voice_channels),                        inline=True)
-    e.add_field(name="Rôles",                          value=len(g.roles),                                 inline=True)
-    e.add_field(name="Emojis",                         value=f"{len(g.emojis)}/{g.emoji_limit}",           inline=True)
-    e.add_field(name=f"{E_NITRO} Niveau boost",        value=f"Niveau {g.premium_tier}",                   inline=True)
-    e.add_field(name=f"{E_NITRO} Boosts",              value=g.premium_subscription_count or 0,            inline=True)
+    e.add_field(name="ID",            value=g.id,                                         inline=True)
+    e.add_field(name="Propriétaire",  value=g.owner.mention,                              inline=True)
+    e.add_field(name="Membres",       value=g.member_count,                               inline=True)
+    e.add_field(name="Salons texte",  value=len(g.text_channels),                         inline=True)
+    e.add_field(name="Salons vocaux", value=len(g.voice_channels),                        inline=True)
+    e.add_field(name="Rôles",         value=len(g.roles),                                 inline=True)
+    e.add_field(name="Emojis",        value=f"{len(g.emojis)}/{g.emoji_limit}",           inline=True)
+    e.add_field(name="Niveau boost",  value=f"⭐ Niveau {g.premium_tier}",                inline=True)
+    e.add_field(name="Boosts",        value=g.premium_subscription_count or 0,            inline=True)
     e.add_field(name="Créé le",       value=f"<t:{int(g.created_at.timestamp())}:F>",     inline=False)
     if g.banner:
         e.set_image(url=g.banner.url)
@@ -3870,12 +3830,12 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
 
     # ── STATUS ────────────────────────────────────────────────────────────
     if sc == "status":
-        def oc(val): return f"{E_ACTIVE} ON" if val else f"{E_DEACTIVATED} OFF"
+        def oc(val): return "🟢 ON" if val else "🔴 OFF"
         exempt_roles    = [ctx.guild.get_role(int(r)) for r in am_cfg.get("exempt_roles", []) if ctx.guild.get_role(int(r))]
         exempt_channels = [ctx.guild.get_channel(int(c)) for c in am_cfg.get("exempt_channels", []) if ctx.guild.get_channel(int(c))]
         whitelist = am_cfg.get("whitelist_domains", [])
 
-        e = discord.Embed(title=f"{E_SHIELD_BLUE} Configuration AutoMod", color=discord.Color.blurple() if am_cfg.get("enabled") else discord.Color.greyple(), timestamp=datetime.now(timezone.utc))
+        e = discord.Embed(title="🛡️ Configuration AutoMod", color=discord.Color.blurple() if am_cfg.get("enabled") else discord.Color.greyple(), timestamp=datetime.now(timezone.utc))
         e.add_field(name="🔘 Statut global", value=oc(am_cfg.get("enabled")), inline=False)
         e.add_field(
             name="📋 Règles",
@@ -4252,16 +4212,16 @@ async def statistic_cmd(ctx, member: discord.Member = None):
     )
     e.set_thumbnail(url=member.display_avatar.url)
     e.add_field(
-        name=f"{E_MESSAGE} Messages",
+        name="💬 Messages",
         value=f"**{msg_count}** message(s) envoyé(s)\n*(depuis le dernier démarrage du bot)*",
         inline=False
     )
     e.add_field(
-        name=f"{E_SPEAKER} Temps en vocal",
+        name="🔊 Temps en vocal",
         value=(
             f"**{voice_str}**\n"
             f"*(depuis le dernier démarrage du bot)*\n"
-            + (f"{E_ACTIVE} Actuellement dans {voice_channel.mention}" if voice_channel else f"{E_OFFLINE} Pas en vocal")
+            + (f"📍 Actuellement dans {voice_channel.mention}" if voice_channel else "📴 Pas en vocal")
         ),
         inline=False
     )
@@ -4306,7 +4266,7 @@ async def leaderboard_cmd(ctx):
             return f"{m}m {s}s"
         return f"{s}s"
 
-    medals = [E_TROPHY1, E_TROPHY2, E_TROPHY3]
+    medals = ["🥇", "🥈", "🥉"]
 
     # ── Top 3 Messages ──
     msg_lines = []
@@ -4325,7 +4285,7 @@ async def leaderboard_cmd(ctx):
         member = ctx.guild.get_member(uid)
         name = member.display_name if member else f"<@{uid}>"
         medal = medals[i] if i < 3 else f"#{i+1}"
-        voice_lines.append(f"{medal} **{name}** — `{format_voice(seconds)}`")  
+        voice_lines.append(f"{medal} **{name}** — `{format_voice(seconds)}`")
 
     if not voice_lines:
         voice_lines = ["*Aucune donnée disponible*"]
@@ -4350,7 +4310,7 @@ async def leaderboard_cmd(ctx):
         your_voice_str = "Aucune donnée"
 
     e = discord.Embed(
-        title=f"{E_TROPHY_FIX} Classement de {ctx.guild.name}",
+        title=f"🏆 Classement de {ctx.guild.name}",
         description="*Statistiques depuis le dernier démarrage du bot.*",
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc)
@@ -4359,20 +4319,20 @@ async def leaderboard_cmd(ctx):
         e.set_thumbnail(url=ctx.guild.icon.url)
 
     e.add_field(
-        name=f"{E_MESSAGE} Top 3 — Messages",
+        name="💬 Top 3 — Messages",
         value="\n".join(msg_lines),
         inline=False
     )
     e.add_field(
-        name=f"{E_SPEAKER} Top 3 — Temps vocal",
+        name="🔊 Top 3 — Temps vocal",
         value="\n".join(voice_lines),
         inline=False
     )
     e.add_field(
         name=f"📊 Ton classement — {ctx.author.display_name}",
         value=(
-            f"{E_MESSAGE} Messages : {your_msg_str}\n"
-            f"{E_SPEAKER} Vocal : {your_voice_str}"
+            f"💬 Messages : {your_msg_str}\n"
+            f"🔊 Vocal : {your_voice_str}"
         ),
         inline=False
     )
