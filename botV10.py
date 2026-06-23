@@ -145,10 +145,10 @@ def mod_embed(title, description, color=discord.Color.red()):
     )
 
 def success_embed(title, description):
-    return mod_embed(title, description, discord.Color.green())
+    return mod_embed(title, description, discord.Color.from_rgb(0, 0, 0))
 
 def info_embed(title, description):
-    return mod_embed(title, description, discord.Color.blurple())
+    return mod_embed(title, description, discord.Color.from_rgb(0, 0, 0))
 
 def warning_embed(title, description):
     return mod_embed(title, description, discord.Color.yellow())
@@ -1527,7 +1527,7 @@ def build_home_embed(author: discord.User) -> discord.Embed:
                 for data in HELP_SECTIONS.values()
             )
         ),
-        color=discord.Color.blurple(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     e.set_footer(text=f"Demandé par {author}", icon_url=author.display_avatar.url)
@@ -1554,7 +1554,7 @@ def build_section_embed(key: str, author: discord.User, page: int = 0) -> discor
     e = discord.Embed(
         title=data["label"],
         description="\n".join(pages[page]),
-        color=data["color"],
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     footer_page = f"Page {page + 1}/{total} • {len(HELP_SECTIONS[key]['commands'])} commande(s)"
@@ -1604,11 +1604,6 @@ class HelpView(discord.ui.View):
         self.select = HelpSelect(author, self)
         self.add_item(self.select)
 
-        # Bouton accueil
-        self.home_btn = discord.ui.Button(emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
-        self.home_btn.callback = self.go_home
-        self.add_item(self.home_btn)
-
         # Bouton page précédente
         self.prev_btn = discord.ui.Button(emoji="◀", style=discord.ButtonStyle.primary, row=1, disabled=True)
         self.prev_btn.callback = self.go_prev
@@ -1630,20 +1625,28 @@ class HelpView(discord.ui.View):
             return 1
         return len(build_section_pages(self.current_section))
 
+    def _rebuild_pagination(self):
+        """Ajoute ou retire les boutons de pagination selon le nombre de pages."""
+        total = self._total_pages()
+        has_pagination = any(item is self.prev_btn for item in self.children)
+
+        if total > 1 and not has_pagination:
+            self.add_item(self.prev_btn)
+            self.add_item(self.page_label)
+            self.add_item(self.next_btn)
+        elif total <= 1 and has_pagination:
+            self.remove_item(self.prev_btn)
+            self.remove_item(self.page_label)
+            self.remove_item(self.next_btn)
+
     def update_buttons(self):
         total = self._total_pages()
-        self.prev_btn.disabled  = (self.current_page <= 0 or self.current_section == "home")
-        self.next_btn.disabled  = (self.current_page >= total - 1 or self.current_section == "home")
-        self.page_label.label   = f"{self.current_page + 1}/{total}"
-        self.page_label.disabled = True
-
-    async def go_home(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author.id:
-            return await interaction.response.send_message("❌ Ce menu ne t'appartient pas.", ephemeral=True)
-        self.current_section = "home"
-        self.current_page    = 0
-        self.update_buttons()
-        await interaction.response.edit_message(embed=build_home_embed(self.author), view=self)
+        self._rebuild_pagination()
+        if total > 1:
+            self.prev_btn.disabled  = (self.current_page <= 0)
+            self.next_btn.disabled  = (self.current_page >= total - 1)
+            self.page_label.label   = f"{self.current_page + 1}/{total}"
+            self.page_label.disabled = True
 
     async def go_prev(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
@@ -2215,7 +2218,7 @@ async def renamechan(ctx, channel: discord.abc.GuildChannel, *, nouveau_nom: str
 GIVEAWAY_EMOJI = "🎉"
 
 def giveaway_embed(prize, winners, end_ts, host, ended=False, winner_mentions=None):
-    color  = discord.Color.green() if not ended else discord.Color.greyple()
+    color  = discord.Color.from_rgb(0, 0, 0)
     status = "🎉 **GIVEAWAY**" if not ended else "🏁 **GIVEAWAY TERMINÉ**"
     desc   = f"**Prix :** {prize}\n**Gagnants :** {winners}\n**Organisé par :** {host.mention}\n"
     if not ended:
@@ -2940,7 +2943,7 @@ async def create_ticket_channel(interaction: discord.Interaction, type_id: str, 
     e = discord.Embed(
         title=f"{ttype.get('emoji', '🎫')} {ttype.get('label', type_id)} — Ticket #{number}",
         description=welcome,
-        color=discord.Color.purple(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     if answers:
@@ -3134,7 +3137,7 @@ async def tickettypes(ctx):
     tcfg = get_ticket_cfg(gid)
     if not tcfg["types"]:
         return await ctx.reply(f"ℹ️ Aucun type de ticket configuré. Crée-en un avec `{PREFIX}ticketadd <nom>`.")
-    e = discord.Embed(title="🎫 Types de tickets configurés", color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
+    e = discord.Embed(title="🎫 Types de tickets configurés", color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     for tid, t in tcfg["types"].items():
         cat = ctx.guild.get_channel(int(t["category_id"])) if t.get("category_id") else None
         roles = [ctx.guild.get_role(int(r)) for r in t.get("staff_roles", [])]
@@ -3169,7 +3172,7 @@ async def ticketpanel(ctx, channel: discord.TextChannel, *, contenu: str = None)
         description = "Clique sur un bouton ci-dessous pour ouvrir un ticket."
 
     type_ids = list(tcfg["types"].keys())[:25]
-    e = discord.Embed(title=titre, description=description, color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
+    e = discord.Embed(title=titre, description=description, color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     e.set_footer(text=f"Panneau créé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
 
     view = build_panel_view(gid, type_ids)
@@ -3200,7 +3203,7 @@ async def ticketsettings(ctx, option: str = None, *, valeur: str = None):
 
     if not option:
         log_ch = ctx.guild.get_channel(int(settings["log_channel"])) if settings.get("log_channel") else None
-        e = discord.Embed(title="🎫 Paramètres des tickets", color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
+        e = discord.Embed(title="🎫 Paramètres des tickets", color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
         e.add_field(name="Max tickets / membre", value=f"`{settings.get('max_per_user', 1)}`", inline=True)
         e.add_field(name="Confirmation fermeture", value="🟢 ON" if settings.get("confirm_close", True) else "🔴 OFF", inline=True)
         e.add_field(name="Ping staff à l'ouverture", value="🟢 ON" if settings.get("ping_staff", True) else "🔴 OFF", inline=True)
@@ -3277,7 +3280,7 @@ async def marry(ctx, member: discord.Member):
     e = discord.Embed(
         title="💍 Demande en mariage",
         description=f"{ctx.author.mention} demande {member.mention} en mariage !\n\n{member.mention}, acceptes-tu ? Réponds `oui` ou `non` dans les 30 secondes.",
-        color=discord.Color.pink(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     await ctx.send(embed=e)
@@ -3298,7 +3301,7 @@ async def marry(ctx, member: discord.Member):
     e = discord.Embed(
         title="💒 Mariage célébré !",
         description=f"🎊 {ctx.author.mention} et {member.mention} sont maintenant mariés !\nFélicitations ! 💕",
-        color=discord.Color.pink(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     await ctx.send(embed=e)
@@ -3338,7 +3341,7 @@ async def couples(ctx):
         n1 = m1.display_name if m1 else f"<@{uid1}>"
         n2 = m2.display_name if m2 else f"<@{uid2}>"
         lines.append(f"💕 **{n1}** & **{n2}**")
-    e = discord.Embed(title="💒 Couples du serveur", description="\n".join(lines) or "Aucun couple.", color=discord.Color.pink(), timestamp=datetime.now(timezone.utc))
+    e = discord.Embed(title="💒 Couples du serveur", description="\n".join(lines) or "Aucun couple.", color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     await ctx.send(embed=e)
 
 # ─────────────────────────────────────────
@@ -3381,7 +3384,7 @@ async def stats(ctx):
 
     e = discord.Embed(
         title=f"🏆 {g.name} Statistiques",
-        color=discord.Color.from_str("#2b2d31"),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     if g.icon:
@@ -3413,7 +3416,7 @@ async def botinfo(ctx):
 
     e = discord.Embed(
         title=f"🤖 {bot.user.name} — Informations",
-        color=discord.Color.blurple(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     if bot.user.avatar:
@@ -3442,8 +3445,7 @@ async def botinfo(ctx):
 async def ping(ctx):
     """Afficher la latence du bot."""
     latency = round(bot.latency * 1000)
-    color = discord.Color.green() if latency < 100 else discord.Color.orange() if latency < 200 else discord.Color.red()
-    e = discord.Embed(title="🏓 Pong !", color=color)
+    e = discord.Embed(title="🏓 Pong !", color=discord.Color.from_rgb(0, 0, 0))
     e.add_field(name="Latence API", value=f"**{latency}ms**", inline=True)
     e.add_field(name="Statut", value="🟢 En ligne", inline=True)
     await ctx.send(embed=e)
@@ -3495,7 +3497,7 @@ async def eight_ball(ctx, *, question: str):
     ]
     e = discord.Embed(
         title="🎱 Boule Magique",
-        color=discord.Color.dark_purple(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     e.add_field(name="❓ Question", value=question, inline=False)
@@ -3652,7 +3654,7 @@ async def embed(ctx, *, contenu: str):
 @commands.has_permissions(manage_guild=True)
 async def announce(ctx, *, message: str):
     """Faire une annonce en embed. Usage : +announce <message>"""
-    e = discord.Embed(title="📢 Annonce", description=message, color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+    e = discord.Embed(title="📢 Annonce", description=message, color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     e.set_footer(text=f"Par {ctx.author}", icon_url=ctx.author.display_avatar.url)
     await ctx.message.delete()
     await ctx.send("@everyone", embed=e)
@@ -3664,7 +3666,7 @@ async def announce(ctx, *, message: str):
 async def avatar(ctx, member: discord.Member = None):
     """Afficher l'avatar d'un membre."""
     member = member or ctx.author
-    e = discord.Embed(title=f"🖼️ Avatar de {member}", color=member.color)
+    e = discord.Embed(title=f"🖼️ Avatar de {member}", color=discord.Color.from_rgb(0, 0, 0))
     e.set_image(url=member.display_avatar.url)
     e.add_field(name="Lien direct", value=f"[Ouvrir]({member.display_avatar.url})")
     await ctx.send(embed=e)
@@ -3725,7 +3727,7 @@ async def userinfo(ctx, member: discord.Member = None):
     warn_count = len(warns_db.get(gid, {}).get(uid, []))
     married_to = marriages_db.get(gid, {}).get(uid)
 
-    e = discord.Embed(title=f"👤 {member}", color=member.color, timestamp=datetime.now(timezone.utc))
+    e = discord.Embed(title=f"👤 {member}", color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     e.set_thumbnail(url=member.display_avatar.url)
     e.add_field(name="ID",          value=member.id,                                     inline=True)
     e.add_field(name="Surnom",      value=member.nick or "Aucun",                        inline=True)
@@ -3750,7 +3752,7 @@ async def whois(ctx, member: discord.Member = None):
 async def serverinfo(ctx):
     """Afficher les informations du serveur."""
     g = ctx.guild
-    e = info_embed(f"🏠 {g.name}", "")
+    e = discord.Embed(title=f"🏠 {g.name}", description="", color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     if g.icon:
         e.set_thumbnail(url=g.icon.url)
     e.add_field(name="ID",            value=g.id,                                         inline=True)
@@ -3771,7 +3773,7 @@ async def serverinfo(ctx):
 async def roleinfo(ctx, role: discord.Role):
     """Afficher les informations d'un rôle."""
     perms = [p.replace("_", " ").title() for p, v in role.permissions if v]
-    e = discord.Embed(title=f"🏷️ Rôle : {role.name}", color=role.color, timestamp=datetime.now(timezone.utc))
+    e = discord.Embed(title=f"🏷️ Rôle : {role.name}", color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     e.add_field(name="ID",           value=role.id,                         inline=True)
     e.add_field(name="Couleur",      value=str(role.color),                 inline=True)
     e.add_field(name="Membres",      value=len(role.members),               inline=True)
@@ -3835,7 +3837,7 @@ async def automod_cmd(ctx, sous_commande: str = "status", *args):
         exempt_channels = [ctx.guild.get_channel(int(c)) for c in am_cfg.get("exempt_channels", []) if ctx.guild.get_channel(int(c))]
         whitelist = am_cfg.get("whitelist_domains", [])
 
-        e = discord.Embed(title="🛡️ Configuration AutoMod", color=discord.Color.blurple() if am_cfg.get("enabled") else discord.Color.greyple(), timestamp=datetime.now(timezone.utc))
+        e = discord.Embed(title="🛡️ Configuration AutoMod", color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
         e.add_field(name="🔘 Statut global", value=oc(am_cfg.get("enabled")), inline=False)
         e.add_field(
             name="📋 Règles",
@@ -4169,7 +4171,7 @@ async def invites_cmd(ctx, member: discord.Member = None):
             f"✨ **{bonus}** bonus\n\n"
             f"This user has currently **{max(total, 0)}** invites ! 👋"
         ),
-        color=discord.Color.blurple(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     e.set_thumbnail(url=member.display_avatar.url)
@@ -4207,7 +4209,7 @@ async def statistic_cmd(ctx, member: discord.Member = None):
 
     e = discord.Embed(
         title=f"📊 Statistiques de {member.display_name}",
-        color=member.color or discord.Color.blurple(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     e.set_thumbnail(url=member.display_avatar.url)
@@ -4312,7 +4314,7 @@ async def leaderboard_cmd(ctx):
     e = discord.Embed(
         title=f"🏆 Classement de {ctx.guild.name}",
         description="*Statistiques depuis le dernier démarrage du bot.*",
-        color=discord.Color.gold(),
+        color=discord.Color.from_rgb(0, 0, 0),
         timestamp=datetime.now(timezone.utc)
     )
     if ctx.guild.icon:
