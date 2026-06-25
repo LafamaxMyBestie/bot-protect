@@ -509,7 +509,7 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.CommandNotFound):
         pass
     else:
-        log.error(f"Erreur non gérée dans '{ctx.command}': {traceback.format_exc()}")
+        log.error(f"Erreur non gérée dans '{ctx.command}': {''.join(traceback.format_exception(type(error), error, error.__traceback__))}")
         try:
             await ctx.reply("❌ Une erreur interne est survenue. Réessaie plus tard.")
         except discord.Forbidden:
