@@ -2402,7 +2402,6 @@ class RolePanelSelect(discord.ui.Select):
         options_data : liste de dicts
             { "label": str, "emoji": str|None, "description": str|None, "role_id": int }
         """
-        self.panel_id = panel_id
         options = []
         for item in options_data:
             opt = discord.SelectOption(
@@ -2422,6 +2421,8 @@ class RolePanelSelect(discord.ui.Select):
             options=options,
             custom_id=f"rolepanel:{panel_id}",
         )
+        # Assigner APRÈS super().__init__() pour ne pas écraser les attributs internes
+        self.panel_id = panel_id
 
     async def callback(self, interaction: discord.Interaction):
         guild  = interaction.guild
