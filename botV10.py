@@ -474,6 +474,7 @@ async def on_ready():
         # les menus déroulants/boutons des panneaux de tickets cessaient de
         # répondre après chaque redémarrage du bot (vue non persistante ré-attachée).
         register_ticket_views()
+        register_rolepanel_views()
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching, name=f"{PREFIX}help · modération"))
 
@@ -2381,6 +2382,403 @@ async def removereactionrole(ctx, message_id: int, emoji: str):
         del rreactions_db[gid][mid]
     save_rreactions()
     await ctx.reply(embed=success_embed("✅ Reaction Role supprimé", f"L'emoji {emoji} sur le message `{message_id}` ne donne plus de rôle."))
+
+# ─────────────────────────────────────────
+#  ROLE PANEL (dropdown self-role)
+# ─────────────────────────────────────────
+# Fichier de persistance
+ROLEPANEL_FILE = "rolepanels.json"
+rolepanel_db   = load_json(ROLEPANEL_FILE)
+
+def save_rolepanels():
+    save_json(ROLEPANEL_FILE, rolepanel_db)
+
+# ── Vue Select persistante ────────────────────────────────────────────────────
+class RolePanelSelect(discord.ui.Select):
+    """Dropdown qui attribue / retire les rôles selon le panel."""
+
+    def __init__(self, panel_id: str, options_data: list):
+        """
+        options_data : liste de dicts
+            { "label": str, "emoji": str|None, "description": str|None, "role_id": int }
+        """
+        self.panel_id = panel_id
+        options = []
+        for item in options_data:
+            opt = discord.SelectOption(
+                label=item["label"],
+                value=str(item["role_id"]),
+                emoji=item.get("emoji") or None,
+                description=item.get("description") or None,
+            )
+            options.append(opt)
+
+        # Discord autorise max 25 options par Select
+        options = options[:25]
+        super().__init__(
+            placeholder="Fais un choix",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            custom_id=f"rolepanel:{panel_id}",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild  = interaction.guild
+        member = interaction.user
+
+        # Récupérer le panel
+        gid   = str(guild.id)
+        panel = rolepanel_db.get(gid, {}).get(self.panel_id)
+        if not panel:
+            return await interaction.response.send_message(
+                "❌ Ce panel n'existe plus.", ephemeral=True
+            )
+
+        # Ensemble des role_id disponibles dans ce panel
+        all_role_ids = {str(o["role_id"]) for o in panel["options"]}
+        # Rôles choisis par l'utilisateur
+        chosen_ids   = set(self.values)
+
+        added   = []
+        removed = []
+        errors  = []
+
+        for role_id_str in all_role_ids:
+            role = guild.get_role(int(role_id_str))
+            if not role:
+                continue
+            has_role = role in member.roles
+            if role_id_str in chosen_ids and not has_role:
+                try:
+                    await member.add_roles(role, reason="Role Panel")
+                    added.append(role.mention)
+                except discord.Forbidden:
+                    errors.append(role.name)
+            elif role_id_str not in chosen_ids and has_role:
+                try:
+                    await member.remove_roles(role, reason="Role Panel")
+                    removed.append(role.mention)
+                except discord.Forbidden:
+                    errors.append(role.name)
+
+        lines = []
+        if added:
+            lines.append(f"✅ **Ajouté(s) :** {', '.join(added)}")
+        if removed:
+            lines.append(f"➖ **Retiré(s) :** {', '.join(removed)}")
+        if errors:
+            lines.append(f"❌ **Erreur (hiérarchie) :** {', '.join(errors)}")
+        if not lines:
+            lines.append("Aucun changement.")
+
+        await interaction.response.send_message(
+            embed=success_embed("🏷️ Rôles mis à jour", "\n".join(lines)),
+            ephemeral=True,
+        )
+
+class RolePanelView(discord.ui.View):
+    """Vue persistante contenant le Select d'un panel."""
+
+    def __init__(self, panel_id: str, options_data: list):
+        super().__init__(timeout=None)
+        self.add_item(RolePanelSelect(panel_id, options_data))
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def build_rolepanel_view(gid: str, panel_id: str) -> RolePanelView | None:
+    panel = rolepanel_db.get(gid, {}).get(panel_id)
+    if not panel or not panel.get("options"):
+        return None
+    return RolePanelView(panel_id, panel["options"])
+
+def register_rolepanel_views():
+    """Ré-enregistre toutes les vues persistantes au démarrage."""
+    for gid, panels in rolepanel_db.items():
+        for panel_id, panel in panels.items():
+            if not panel.get("options"):
+                continue
+            view = RolePanelView(panel_id, panel["options"])
+            msg_id = panel.get("message_id")
+            try:
+                if msg_id:
+                    bot.add_view(view, message_id=int(msg_id))
+                else:
+                    bot.add_view(view)
+            except Exception:
+                pass
+
+def build_rolepanel_embed(panel: dict) -> discord.Embed:
+    """Construit l'embed d'un panel."""
+    title = panel.get("title", "🏷️ Rôles")
+    desc  = panel.get("description", "Sélectionne les rôles que tu souhaites recevoir.")
+    color_hex = panel.get("color", "000000")
+    try:
+        color = discord.Color(int(color_hex.lstrip("#"), 16))
+    except Exception:
+        color = discord.Color.from_rgb(0, 0, 0)
+
+    e = discord.Embed(title=title, description=desc, color=color)
+    # Lister les options
+    lines = []
+    for opt in panel.get("options", []):
+        emoji = opt.get("emoji") or "•"
+        label = opt["label"]
+        role_id = opt["role_id"]
+        desc_opt = opt.get("description", "")
+        line = f"{emoji} <@&{role_id}>"
+        if desc_opt:
+            line += f" — *{desc_opt}*"
+        lines.append(line)
+    if lines:
+        e.add_field(name="\u200b", value="\n".join(lines), inline=False)
+    thumbnail = panel.get("thumbnail")
+    if thumbnail:
+        e.set_thumbnail(url=thumbnail)
+    footer = panel.get("footer")
+    if footer:
+        e.set_footer(text=footer)
+    return e
+
+# ── Commandes ─────────────────────────────────────────────────────────────────
+@bot.command(name="rolepanel")
+@commands.has_permissions(manage_roles=True)
+async def rolepanel_cmd(ctx, *, args: str = ""):
+    """Système de panneau de rôles (dropdown). Usage : +rolepanel <sous-commande>
+
+    Sous-commandes :
+      create <id>                          — créer un nouveau panel
+      title  <id> <texte>                  — définir le titre de l'embed
+      desc   <id> <texte>                  — définir la description
+      color  <id> <#hexcode>               — couleur de l'embed (ex: #7289DA)
+      thumbnail <id> <url>                 — miniature de l'embed
+      footer <id> <texte>                  — footer de l'embed
+      add    <id> @rôle [emoji] [desc]     — ajouter une option
+      remove <id> @rôle                    — retirer une option
+      send   <id>                          — envoyer le panel dans ce salon
+      delete <id>                          — supprimer un panel
+      list                                 — lister les panels du serveur
+      preview <id>                         — prévisualiser sans envoyer
+    """
+    gid    = str(ctx.guild.id)
+    parts  = args.split()
+
+    if not parts:
+        return await ctx.reply(embed=info_embed(
+            "🏷️ Role Panel — Aide",
+            "**+rolepanel create <id>** — créer un panel\n"
+            "**+rolepanel title <id> <texte>** — titre de l'embed\n"
+            "**+rolepanel desc <id> <texte>** — description\n"
+            "**+rolepanel color <id> #hexcode** — couleur\n"
+            "**+rolepanel thumbnail <id> <url>** — image\n"
+            "**+rolepanel footer <id> <texte>** — footer\n"
+            "**+rolepanel add <id> @rôle [emoji] [desc]** — ajouter un rôle\n"
+            "**+rolepanel remove <id> @rôle** — retirer un rôle\n"
+            "**+rolepanel send <id>** — envoyer ici\n"
+            "**+rolepanel delete <id>** — supprimer\n"
+            "**+rolepanel list** — lister\n"
+            "**+rolepanel preview <id>** — prévisualiser"
+        ))
+
+    sub = parts[0].lower()
+
+    # ── list ──────────────────────────────────────────────────────────────────
+    if sub == "list":
+        panels = rolepanel_db.get(gid, {})
+        if not panels:
+            return await ctx.reply("❌ Aucun panel sur ce serveur.")
+        lines = []
+        for pid, panel in panels.items():
+            n_opts = len(panel.get("options", []))
+            sent   = "✅ envoyé" if panel.get("message_id") else "⏳ non envoyé"
+            lines.append(f"• **{pid}** — *{panel.get('title','Sans titre')}* — {n_opts} rôle(s) — {sent}")
+        return await ctx.reply(embed=info_embed("🏷️ Role Panels", "\n".join(lines)))
+
+    # ── Sous-commandes nécessitant un <id> ───────────────────────────────────
+    if len(parts) < 2:
+        return await ctx.reply("❌ Précise l'ID du panel. Ex : `+rolepanel create monpanel`")
+    panel_id = parts[1].lower()
+    rolepanel_db.setdefault(gid, {})
+
+    # ── create ────────────────────────────────────────────────────────────────
+    if sub == "create":
+        if panel_id in rolepanel_db[gid]:
+            return await ctx.reply(f"❌ Un panel avec l'ID `{panel_id}` existe déjà.")
+        rolepanel_db[gid][panel_id] = {
+            "title":       "🏷️ Rôles Notifications",
+            "description": "Sélectionne les rôles que tu souhaites recevoir.",
+            "color":       "000000",
+            "thumbnail":   None,
+            "footer":      None,
+            "options":     [],
+            "message_id":  None,
+            "channel_id":  None,
+        }
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed(
+            "✅ Panel créé",
+            f"Panel `{panel_id}` créé.\n"
+            f"Ajoute des rôles avec `+rolepanel add {panel_id} @rôle [emoji] [desc]`\n"
+            f"Puis envoie-le avec `+rolepanel send {panel_id}`"
+        ))
+
+    # ── Vérifier existence pour les autres sous-commandes ─────────────────────
+    if sub not in ("create",) and panel_id not in rolepanel_db.get(gid, {}):
+        return await ctx.reply(f"❌ Panel `{panel_id}` introuvable. Crée-le avec `+rolepanel create {panel_id}`.")
+
+    panel = rolepanel_db[gid][panel_id]
+
+    # ── title ─────────────────────────────────────────────────────────────────
+    if sub == "title":
+        text = " ".join(parts[2:])
+        if not text:
+            return await ctx.reply("❌ Précise le titre.")
+        panel["title"] = text
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed("✅ Titre mis à jour", f"**{text}**"))
+
+    # ── desc ──────────────────────────────────────────────────────────────────
+    elif sub == "desc":
+        text = " ".join(parts[2:])
+        if not text:
+            return await ctx.reply("❌ Précise la description.")
+        panel["description"] = text
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed("✅ Description mise à jour", text))
+
+    # ── color ─────────────────────────────────────────────────────────────────
+    elif sub == "color":
+        if len(parts) < 3:
+            return await ctx.reply("❌ Précise un code hex. Ex : `#7289DA`")
+        hex_code = parts[2].lstrip("#")
+        try:
+            int(hex_code, 16)
+            assert len(hex_code) == 6
+        except Exception:
+            return await ctx.reply("❌ Code hex invalide. Exemple : `#7289DA`")
+        panel["color"] = hex_code
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed("✅ Couleur mise à jour", f"#{hex_code}"))
+
+    # ── thumbnail ─────────────────────────────────────────────────────────────
+    elif sub == "thumbnail":
+        if len(parts) < 3:
+            return await ctx.reply("❌ Précise une URL d'image.")
+        panel["thumbnail"] = parts[2]
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed("✅ Thumbnail mis à jour", parts[2]))
+
+    # ── footer ────────────────────────────────────────────────────────────────
+    elif sub == "footer":
+        text = " ".join(parts[2:])
+        if not text:
+            return await ctx.reply("❌ Précise le texte du footer.")
+        panel["footer"] = text
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed("✅ Footer mis à jour", text))
+
+    # ── add ───────────────────────────────────────────────────────────────────
+    elif sub == "add":
+        # +rolepanel add <id> @rôle [emoji] [description...]
+        if len(parts) < 3:
+            return await ctx.reply("❌ Précise un rôle. Ex : `+rolepanel add monpanel @Informations 🔔`")
+        # Extraire le rôle (mention ou ID)
+        role = None
+        try:
+            role = await commands.RoleConverter().convert(ctx, parts[2])
+        except Exception:
+            return await ctx.reply("❌ Rôle introuvable.")
+        if role >= ctx.guild.me.top_role:
+            return await ctx.reply("❌ Je ne peux pas gérer ce rôle (hiérarchie).")
+        if len(panel["options"]) >= 25:
+            return await ctx.reply("❌ Maximum 25 options par panel (limite Discord).")
+        # Déjà présent ?
+        for opt in panel["options"]:
+            if opt["role_id"] == role.id:
+                return await ctx.reply(f"❌ {role.mention} est déjà dans ce panel.")
+        emoji = parts[3] if len(parts) > 3 else None
+        desc  = " ".join(parts[4:]) if len(parts) > 4 else None
+        panel["options"].append({
+            "label":       role.name,
+            "role_id":     role.id,
+            "emoji":       emoji,
+            "description": desc,
+        })
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed(
+            "✅ Option ajoutée",
+            f"{emoji or ''} {role.mention}" + (f"\n*{desc}*" if desc else "")
+        ))
+
+    # ── remove ────────────────────────────────────────────────────────────────
+    elif sub == "remove":
+        if len(parts) < 3:
+            return await ctx.reply("❌ Précise un rôle.")
+        try:
+            role = await commands.RoleConverter().convert(ctx, parts[2])
+        except Exception:
+            return await ctx.reply("❌ Rôle introuvable.")
+        before = len(panel["options"])
+        panel["options"] = [o for o in panel["options"] if o["role_id"] != role.id]
+        if len(panel["options"]) == before:
+            return await ctx.reply(f"❌ {role.mention} n'est pas dans ce panel.")
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed("✅ Option retirée", role.mention))
+
+    # ── preview ───────────────────────────────────────────────────────────────
+    elif sub == "preview":
+        if not panel["options"]:
+            return await ctx.reply("❌ Aucune option dans ce panel. Ajoute des rôles avec `+rolepanel add`.")
+        embed = build_rolepanel_embed(panel)
+        view  = RolePanelView(panel_id, panel["options"])
+        return await ctx.send(
+            content="👁️ **Prévisualisation** (non sauvegardée)",
+            embed=embed,
+            view=view
+        )
+
+    # ── send ──────────────────────────────────────────────────────────────────
+    elif sub == "send":
+        if not panel["options"]:
+            return await ctx.reply("❌ Aucune option dans ce panel. Ajoute des rôles avec `+rolepanel add`.")
+        embed = build_rolepanel_embed(panel)
+        view  = RolePanelView(panel_id, panel["options"])
+        # Supprimer le message précédent si on renvoie
+        if panel.get("message_id") and panel.get("channel_id"):
+            try:
+                old_ch = ctx.guild.get_channel(int(panel["channel_id"]))
+                if old_ch:
+                    old_msg = await old_ch.fetch_message(int(panel["message_id"]))
+                    await old_msg.delete()
+            except Exception:
+                pass
+        msg = await ctx.send(embed=embed, view=view)
+        bot.add_view(view, message_id=msg.id)
+        panel["message_id"] = str(msg.id)
+        panel["channel_id"] = str(ctx.channel.id)
+        save_rolepanels()
+        # Supprimer le message de commande
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+    # ── delete ────────────────────────────────────────────────────────────────
+    elif sub == "delete":
+        # Supprimer le message Discord si présent
+        if panel.get("message_id") and panel.get("channel_id"):
+            try:
+                ch = ctx.guild.get_channel(int(panel["channel_id"]))
+                if ch:
+                    msg = await ch.fetch_message(int(panel["message_id"]))
+                    await msg.delete()
+            except Exception:
+                pass
+        del rolepanel_db[gid][panel_id]
+        save_rolepanels()
+        return await ctx.reply(embed=success_embed("✅ Panel supprimé", f"Le panel `{panel_id}` a été supprimé."))
+
+    else:
+        await ctx.reply(f"❌ Sous-commande inconnue : `{sub}`. Tape `+rolepanel` pour l'aide.")
 
 # ─────────────────────────────────────────
 #  RÔLES TEMPORAIRES
