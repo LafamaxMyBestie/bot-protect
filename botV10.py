@@ -509,7 +509,7 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.CommandNotFound):
         pass
     else:
-        log.error(f"Erreur non gérée dans '{ctx.command}': {''.join(traceback.format_exception(type(error), error, error.__traceback__))}")
+        log.error(f"Erreur non gérée dans '{ctx.command}': {traceback.format_exc()}")
         try:
             await ctx.reply("❌ Une erreur interne est survenue. Réessaie plus tard.")
         except discord.Forbidden:
@@ -2404,10 +2404,19 @@ class RolePanelSelect(discord.ui.Select):
         """
         options = []
         for item in options_data:
+            raw_emoji = item.get("emoji") or None
+            parsed_emoji = None
+            if raw_emoji:
+                m = re.match(r"<(a?):(\w+):(\d+)>", raw_emoji.strip())
+                if m:
+                    animated, name, eid = m.group(1), m.group(2), int(m.group(3))
+                    parsed_emoji = discord.PartialEmoji(name=name, id=eid, animated=bool(animated))
+                else:
+                    parsed_emoji = raw_emoji.strip()
             opt = discord.SelectOption(
                 label=item["label"],
                 value=str(item["role_id"]),
-                emoji=item.get("emoji") or None,
+                emoji=parsed_emoji,
                 description=item.get("description") or None,
             )
             options.append(opt)
