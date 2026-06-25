@@ -2393,6 +2393,40 @@ rolepanel_db   = load_json(ROLEPANEL_FILE)
 def save_rolepanels():
     save_json(ROLEPANEL_FILE, rolepanel_db)
 
+async def is_valid_emoji(ctx, raw_emoji: str):
+    """Vérifie qu'un emoji (unicode ou custom) est valide pour Discord, en testant
+    une vraie réaction sur le message de commande — c'est exactement la même
+    validation que celle utilisée côté API pour les menus déroulants."""
+    raw_emoji = raw_emoji.strip()
+    m = re.match(r"^<a?:\w+:(\d+)>$", raw_emoji)
+    if m:
+        emoji_obj = bot.get_emoji(int(m.group(1)))
+        if emoji_obj is None:
+            return False, "Emoji personnalisé inaccessible (mauvais serveur ?)."
+        return True, ""
+    try:
+        await ctx.message.add_reaction(raw_emoji)
+        await ctx.message.remove_reaction(raw_emoji, ctx.guild.me)
+        return True, ""
+    except discord.HTTPException:
+        return False, "Discord ne reconnaît pas ce caractère comme un emoji valide."
+    except discord.Forbidden:
+        return True, ""  # pas de perm pour tester → on n'empêche pas l'ajout
+
+async def check_panel_emojis(ctx, panel: dict):
+    """Teste tous les emojis d'un panel et retourne la liste des erreurs (rôle + raison)."""
+    errors = []
+    for opt in panel.get("options", []):
+        emoji = opt.get("emoji")
+        if not emoji:
+            continue
+        valid, reason = await is_valid_emoji(ctx, emoji)
+        if not valid:
+            role = ctx.guild.get_role(int(opt["role_id"]))
+            role_str = role.mention if role else f"`{opt['role_id']}`"
+            errors.append(f"❌ {role_str} — emoji `{emoji}` : {reason}")
+    return errors
+
 # ── Vue Select persistante ────────────────────────────────────────────────────
 class RolePanelSelect(discord.ui.Select):
     """Dropdown qui attribue / retire les rôles selon le panel."""
@@ -2730,6 +2764,13 @@ async def rolepanel_cmd(ctx, *, args: str = ""):
                 return await ctx.reply(f"❌ {role.mention} est déjà dans ce panel.")
         emoji = parts[3] if len(parts) > 3 else None
         desc  = " ".join(parts[4:]) if len(parts) > 4 else None
+        if emoji:
+            valid, reason = await is_valid_emoji(ctx, emoji)
+            if not valid:
+                return await ctx.reply(
+                    f"❌ Emoji invalide pour {role.mention} : `{emoji}`. {reason}\n"
+                    f"Réessaie avec un emoji copié directement depuis le picker Discord, ou laisse ce champ vide."
+                )
         panel["options"].append({
             "label":       role.name,
             "role_id":     role.id,
@@ -2761,6 +2802,14 @@ async def rolepanel_cmd(ctx, *, args: str = ""):
     elif sub == "preview":
         if not panel["options"]:
             return await ctx.reply("❌ Aucune option dans ce panel. Ajoute des rôles avec `+rolepanel add`.")
+        bad = await check_panel_emojis(ctx, panel)
+        if bad:
+            return await ctx.reply(embed=warning_embed(
+                "⚠️ Emoji(s) invalide(s) détecté(s)",
+                "\n".join(bad) +
+                f"\n\nCorrige avec `{PREFIX}rolepanel remove {panel_id} @rôle` "
+                f"puis `{PREFIX}rolepanel add {panel_id} @rôle <nouvel_emoji>`."
+            ))
         embed = build_rolepanel_embed(panel)
         view  = RolePanelView(panel_id, panel["options"])
         return await ctx.send(
@@ -2773,6 +2822,14 @@ async def rolepanel_cmd(ctx, *, args: str = ""):
     elif sub == "send":
         if not panel["options"]:
             return await ctx.reply("❌ Aucune option dans ce panel. Ajoute des rôles avec `+rolepanel add`.")
+        bad = await check_panel_emojis(ctx, panel)
+        if bad:
+            return await ctx.reply(embed=warning_embed(
+                "⚠️ Emoji(s) invalide(s) détecté(s)",
+                "\n".join(bad) +
+                f"\n\nCorrige avec `{PREFIX}rolepanel remove {panel_id} @rôle` "
+                f"puis `{PREFIX}rolepanel add {panel_id} @rôle <nouvel_emoji>`."
+            ))
         try:
             embed = build_rolepanel_embed(panel)
             view  = RolePanelView(panel_id, panel["options"])
@@ -3476,8 +3533,12 @@ async def ticketedit(ctx, type_id: str, champ: str, *, valeur: str = None):
     elif champ == "emoji":
         if not valeur:
             return await ctx.reply(f"❌ Usage : `{PREFIX}ticketedit {type_id} emoji <emoji>`")
-        ttype["emoji"] = valeur.strip()[:50]
-        msg = f"Emoji mis à jour : {valeur.strip()}"
+        valeur = valeur.strip()
+        valid, reason = await is_valid_emoji(ctx, valeur)
+        if not valid:
+            return await ctx.reply(f"❌ Emoji invalide : `{valeur}`. {reason}")
+        ttype["emoji"] = valeur[:50]
+        msg = f"Emoji mis à jour : {valeur}"
     elif champ == "style":
         if not valeur or valeur.lower() not in BUTTON_STYLES:
             return await ctx.reply(f"❌ Style invalide. Choix possibles : {', '.join(BUTTON_STYLES)}")
