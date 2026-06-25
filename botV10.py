@@ -2398,30 +2398,54 @@ class RolePanelSelect(discord.ui.Select):
     """Dropdown qui attribue / retire les rôles selon le panel."""
 
     def __init__(self, panel_id: str, options_data: list):
-        """
-        options_data : liste de dicts
-            { "label": str, "emoji": str|None, "description": str|None, "role_id": int }
-        """
         options = []
         for item in options_data:
-            raw_emoji = item.get("emoji") or None
+            # Parser l'emoji de façon ultra-défensive
             parsed_emoji = None
-            if raw_emoji:
-                m = re.match(r"<(a?):(\w+):(\d+)>", raw_emoji.strip())
-                if m:
-                    animated, name, eid = m.group(1), m.group(2), int(m.group(3))
-                    parsed_emoji = discord.PartialEmoji(name=name, id=eid, animated=bool(animated))
-                else:
-                    parsed_emoji = raw_emoji.strip()
-            opt = discord.SelectOption(
-                label=item["label"],
-                value=str(item["role_id"]),
-                emoji=parsed_emoji,
-                description=item.get("description") or None,
-            )
-            options.append(opt)
+            try:
+                raw_emoji = item.get("emoji") or None
+                if raw_emoji:
+                    raw_emoji = raw_emoji.strip()
+                    m = re.match(r"<(a?):([\w]+):(\d+)>", raw_emoji)
+                    if m:
+                        animated = bool(m.group(1))
+                        ename    = m.group(2)
+                        eid      = int(m.group(3))
+                        parsed_emoji = discord.PartialEmoji(name=ename, id=eid, animated=animated)
+                    else:
+                        parsed_emoji = raw_emoji
+            except Exception:
+                parsed_emoji = None  # emoji invalide → on l'ignore
 
-        # Discord autorise max 25 options par Select
+            # Créer l'option de façon défensive aussi
+            try:
+                label = str(item.get("label", "Rôle"))[:100]
+                desc  = item.get("description") or None
+                if desc:
+                    desc = str(desc)[:100]
+                opt = discord.SelectOption(
+                    label=label,
+                    value=str(item["role_id"]),
+                    emoji=parsed_emoji,
+                    description=desc,
+                )
+                options.append(opt)
+            except Exception:
+                # Si l'option est invalide (emoji rejeté, etc.), on réessaie sans emoji
+                try:
+                    opt = discord.SelectOption(
+                        label=str(item.get("label", "Rôle"))[:100],
+                        value=str(item["role_id"]),
+                        emoji=None,
+                        description=None,
+                    )
+                    options.append(opt)
+                except Exception:
+                    pass  # Option complètement invalide, on la skip
+
+        if not options:
+            options = [discord.SelectOption(label="Aucun rôle disponible", value="__none__")]
+
         options = options[:25]
         super().__init__(
             placeholder="Fais un choix",
@@ -2430,7 +2454,6 @@ class RolePanelSelect(discord.ui.Select):
             options=options,
             custom_id=f"rolepanel:{panel_id}",
         )
-        # Assigner APRÈS super().__init__() pour ne pas écraser les attributs internes
         self.panel_id = panel_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -2750,8 +2773,13 @@ async def rolepanel_cmd(ctx, *, args: str = ""):
     elif sub == "send":
         if not panel["options"]:
             return await ctx.reply("❌ Aucune option dans ce panel. Ajoute des rôles avec `+rolepanel add`.")
-        embed = build_rolepanel_embed(panel)
-        view  = RolePanelView(panel_id, panel["options"])
+        try:
+            embed = build_rolepanel_embed(panel)
+            view  = RolePanelView(panel_id, panel["options"])
+        except Exception as e:
+            import traceback as _tb
+            log.error(f"[rolepanel send] Erreur construction view/embed : {_tb.format_exc()}")
+            return await ctx.reply(f"❌ Erreur lors de la construction du panel : `{e}`")
         # Supprimer le message précédent si on renvoie
         if panel.get("message_id") and panel.get("channel_id"):
             try:
@@ -2761,7 +2789,12 @@ async def rolepanel_cmd(ctx, *, args: str = ""):
                     await old_msg.delete()
             except Exception:
                 pass
-        msg = await ctx.send(embed=embed, view=view)
+        try:
+            msg = await ctx.send(embed=embed, view=view)
+        except Exception as e:
+            import traceback as _tb
+            log.error(f"[rolepanel send] Erreur ctx.send : {_tb.format_exc()}")
+            return await ctx.reply(f"❌ Erreur lors de l'envoi : `{e}`")
         bot.add_view(view, message_id=msg.id)
         panel["message_id"] = str(msg.id)
         panel["channel_id"] = str(ctx.channel.id)
