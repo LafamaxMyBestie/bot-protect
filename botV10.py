@@ -46,6 +46,7 @@ MARRIAGES_FILE   = "marriages.json"
 TEMPROLES_FILE   = "temproles.json"
 TICKETS_FILE     = "tickets.json"
 RREACTIONS_FILE  = "reaction_roles.json"
+STATSVOC_FILE    = "statsvoc.json"
 
 def load_json(path):
     if not os.path.exists(path):
@@ -68,6 +69,7 @@ marriages_db   = load_json(MARRIAGES_FILE)
 temproles_db   = load_json(TEMPROLES_FILE)
 tickets_db     = load_json(TICKETS_FILE)
 rreactions_db  = load_json(RREACTIONS_FILE)
+statsvoc_db    = load_json(STATSVOC_FILE)
 
 def save_warns():       save_json(WARNS_FILE, warns_db)
 def save_config():      save_json(CONFIG_FILE, config_db)
@@ -77,6 +79,7 @@ def save_marriages():   save_json(MARRIAGES_FILE, marriages_db)
 def save_temproles():   save_json(TEMPROLES_FILE, temproles_db)
 def save_tickets():     save_json(TICKETS_FILE, tickets_db)
 def save_rreactions():  save_json(RREACTIONS_FILE, rreactions_db)
+def save_statsvoc():    save_json(STATSVOC_FILE, statsvoc_db)
 
 def get_guild_cfg(guild_id: int) -> dict:
     key = str(guild_id)
@@ -475,6 +478,8 @@ async def on_ready():
         # répondre après chaque redémarrage du bot (vue non persistante ré-attachée).
         register_ticket_views()
         register_rolepanel_views()
+    if not update_statsvoc_loop.is_running():
+        update_statsvoc_loop.start()
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching, name=f"{PREFIX}help · modération"))
 
@@ -889,6 +894,12 @@ async def on_guild_channel_create(channel):
 
 @bot.event
 async def on_guild_channel_delete(channel):
+    # Nettoyage : si un salon stat-vocale est supprimé manuellement, on retire sa config.
+    svcfg = statsvoc_db.get(str(channel.guild.id))
+    if svcfg and str(channel.id) in svcfg.get("channels", {}):
+        svcfg["channels"].pop(str(channel.id), None)
+        save_statsvoc()
+
     cfg = get_guild_cfg(channel.guild.id)
     ch_id = cfg.get("log_channel")
     if not ch_id:
@@ -1424,7 +1435,8 @@ HELP_SECTIONS = {
             ("ticketrole",      "<type> add/remove <@rôle>",   "Gérer les rôles staff d'un type"),
             ("ticketquestion",  "<type> add/remove/list",      "Gérer le formulaire d'ouverture"),
             ("tickettypes",     "",                            "Lister les types configurés"),
-            ("ticketpanel",     "<salon> [Titre | Description]","Envoyer le panneau de boutons"),
+            ("ticketpanel",     "<salon> [Titre | Description | image: <url>]","Envoyer le panneau (+ image/gif jointe en pièce jointe)"),
+            ("ticketpanelimage","<id_message> <url|none>",     "Changer/retirer l'image d'un panneau déjà envoyé"),
             ("ticketsettings",  "[option] [valeur]",           "Réglages globaux (max, logs, naming…)"),
             ("closeticket",     "",                            "Fermer le ticket (dans le salon ticket)"),
         ],
@@ -1448,6 +1460,7 @@ HELP_SECTIONS = {
         "color": discord.Color.blurple(),
         "commands": [
             ("stats",    "",                             "Statistiques du serveur"),
+            ("statvoc",  "create/format/remove/list",   "Salons vocaux stats auto (membres/en ligne/vocal/boosts)"),
             ("botinfo",  "",                             "Infos et stats du bot"),
             ("ping",     "",                             "Latence du bot"),
             ("uptime",   "",                             "Temps de fonctionnement"),
@@ -3656,14 +3669,39 @@ async def tickettypes(ctx):
         )
     await ctx.send(embed=e)
 
+def _extract_image_url(contenu: str | None, attachments: list) -> tuple:
+    """Extrait une URL d'image/gif depuis le contenu (segment 'image:' ou 'image|')
+    ou depuis une pièce jointe du message. Retourne (contenu_nettoyé, image_url)."""
+    image_url = None
+    if attachments:
+        for att in attachments:
+            ct = (att.content_type or "").lower()
+            if ct.startswith("image/") or att.filename.lower().endswith((".gif", ".png", ".jpg", ".jpeg", ".webp")):
+                image_url = att.url
+                break
+    if contenu:
+        match = re.search(r"(?:^|\|)\s*image\s*[:|]\s*(\S+)", contenu, re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip()
+            if candidate.startswith("http"):
+                if not image_url:
+                    image_url = candidate
+                contenu = (contenu[:match.start()] + contenu[match.end():]).strip()
+                contenu = contenu.rstrip("|").strip()
+    return contenu, image_url
+
 @bot.command(name="ticketpanel")
 @commands.has_permissions(manage_guild=True)
 async def ticketpanel(ctx, channel: discord.TextChannel, *, contenu: str = None):
-    """Envoyer le panneau de tickets (boutons). Usage : +ticketpanel #salon Titre | Description"""
+    """Envoyer le panneau de tickets (boutons).
+    Usage : +ticketpanel #salon Titre | Description | image: <url>
+    Tu peux aussi attacher directement une image/gif à ton message au lieu de mettre une URL."""
     gid = str(ctx.guild.id)
     tcfg = get_ticket_cfg(gid)
     if not tcfg["types"]:
         return await ctx.reply(f"❌ Aucun type de ticket configuré. Crée-en un avec `{PREFIX}ticketadd <nom>` avant d'envoyer un panneau.")
+
+    contenu, image_url = _extract_image_url(contenu, ctx.message.attachments)
 
     if contenu:
         parts = contenu.split("|", 1)
@@ -3676,6 +3714,8 @@ async def ticketpanel(ctx, channel: discord.TextChannel, *, contenu: str = None)
     type_ids = list(tcfg["types"].keys())[:25]
     e = discord.Embed(title=titre, description=description, color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     e.set_footer(text=f"Panneau créé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
+    if image_url:
+        e.set_image(url=image_url)
 
     view = build_panel_view(gid, type_ids)
     try:
@@ -3687,12 +3727,56 @@ async def ticketpanel(ctx, channel: discord.TextChannel, *, contenu: str = None)
         "channel_id": str(channel.id),
         "title":      titre,
         "description": description,
+        "image_url":  image_url,
         "type_ids":   type_ids,
     }
     save_tickets()
     bot.add_view(view, message_id=msg.id)
 
-    await ctx.reply(embed=success_embed("🎫 Panneau envoyé", f"Le panneau de tickets a été envoyé dans {channel.mention} avec {len(type_ids)} bouton(s)."))
+    await ctx.reply(embed=success_embed("🎫 Panneau envoyé", f"Le panneau de tickets a été envoyé dans {channel.mention} avec {len(type_ids)} bouton(s)." + (" et une image." if image_url else "")))
+
+@bot.command(name="ticketpanelimage")
+@commands.has_permissions(manage_guild=True)
+async def ticketpanelimage(ctx, message_id: str, url: str = None):
+    """Ajouter/changer/retirer l'image d'un panneau déjà envoyé.
+    Usage : +ticketpanelimage <id_message> <url|none> (ou attache une image au message)"""
+    gid = str(ctx.guild.id)
+    tcfg = get_ticket_cfg(gid)
+    panel = tcfg["panels"].get(message_id)
+    if not panel:
+        return await ctx.reply("❌ Panneau introuvable. Vérifie l'ID du message du panneau (`+tickettypes`/historique du salon).")
+
+    image_url = None
+    if ctx.message.attachments:
+        for att in ctx.message.attachments:
+            ct = (att.content_type or "").lower()
+            if ct.startswith("image/") or att.filename.lower().endswith((".gif", ".png", ".jpg", ".jpeg", ".webp")):
+                image_url = att.url
+                break
+    elif url and url.lower() != "none" and url.startswith("http"):
+        image_url = url
+
+    channel = ctx.guild.get_channel(int(panel["channel_id"]))
+    if not channel:
+        return await ctx.reply("❌ Le salon de ce panneau n'existe plus.")
+    try:
+        message = await channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return await ctx.reply("❌ Message du panneau introuvable.")
+
+    e = discord.Embed(title=panel["title"], description=panel["description"], color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
+    e.set_footer(text=f"Panneau créé par {ctx.author}", icon_url=ctx.author.display_avatar.url)
+    if image_url:
+        e.set_image(url=image_url)
+
+    try:
+        await message.edit(embed=e)
+    except discord.HTTPException as ex:
+        return await ctx.reply(f"❌ Impossible de modifier le panneau : {ex}")
+
+    panel["image_url"] = image_url
+    save_tickets()
+    await ctx.reply(embed=success_embed("🎫 Image mise à jour", "L'image a été retirée." if not image_url else "L'image du panneau a été mise à jour."))
 
 @bot.command(name="ticketsettings")
 @commands.has_permissions(manage_guild=True)
@@ -3845,6 +3929,189 @@ async def couples(ctx):
         lines.append(f"💕 **{n1}** & **{n2}**")
     e = discord.Embed(title="💒 Couples du serveur", description="\n".join(lines) or "Aucun couple.", color=discord.Color.from_rgb(0, 0, 0), timestamp=datetime.now(timezone.utc))
     await ctx.send(embed=e)
+
+# ─────────────────────────────────────────
+#  Système de salons "stats vocales" (compteurs personnalisables)
+# ─────────────────────────────────────────
+STATSVOC_TYPES = {
+    "membres":  {"label": "Nombre de membres",        "default_format": "👥 Membres : {count}"},
+    "enligne":  {"label": "Membres en ligne",          "default_format": "🟢 En ligne : {count}"},
+    "vocal":    {"label": "Membres en vocal",          "default_format": "🔊 En vocal : {count}"},
+    "boosts":   {"label": "Boosts du serveur",         "default_format": "💎 Boosts : {count}"},
+}
+
+def get_statsvoc_cfg(guild_id) -> dict:
+    gid = str(guild_id)
+    cfg = statsvoc_db.setdefault(gid, {})
+    cfg.setdefault("channels", {})  # channel_id -> {"type": str, "format": str}
+    return cfg
+
+def compute_statsvoc_value(guild: discord.Guild, stat_type: str) -> int:
+    if stat_type == "membres":
+        return guild.member_count or len(guild.members)
+    if stat_type == "enligne":
+        return sum(
+            1 for m in guild.members
+            if not m.bot and m.status not in (discord.Status.offline, None)
+        )
+    if stat_type == "vocal":
+        return sum(1 for vc in guild.voice_channels for m in vc.members if not m.bot)
+    if stat_type == "boosts":
+        return guild.premium_subscription_count or 0
+    return 0
+
+async def update_statsvoc_guild(guild: discord.Guild):
+    """Met à jour (renomme) tous les salons stats-vocales d'un serveur."""
+    gid = str(guild.id)
+    cfg = statsvoc_db.get(gid)
+    if not cfg or not cfg.get("channels"):
+        return
+    if guild.chunked is False:
+        try:
+            await guild.chunk(cache=True)
+        except Exception:
+            pass
+    changed = False
+    for chan_id, data in list(cfg["channels"].items()):
+        channel = guild.get_channel(int(chan_id))
+        if not channel:
+            cfg["channels"].pop(chan_id, None)
+            changed = True
+            continue
+        stat_type = data.get("type")
+        fmt = data.get("format") or STATSVOC_TYPES.get(stat_type, {}).get("default_format", "{count}")
+        count = compute_statsvoc_value(guild, stat_type)
+        new_name = fmt.replace("{count}", str(count))[:100]
+        if channel.name != new_name:
+            try:
+                await channel.edit(name=new_name, reason="Mise à jour stat vocale")
+            except discord.HTTPException:
+                pass
+            except Exception:
+                pass
+    if changed:
+        save_statsvoc()
+
+@tasks.loop(minutes=5)
+async def update_statsvoc_loop():
+    for guild in bot.guilds:
+        try:
+            await update_statsvoc_guild(guild)
+        except Exception:
+            log.error(f"Erreur update_statsvoc_guild ({guild.id}): {traceback.format_exc()}")
+        await asyncio.sleep(1)  # éviter de spammer l'API d'un coup sur plusieurs serveurs
+
+@update_statsvoc_loop.before_loop
+async def before_update_statsvoc_loop():
+    await bot.wait_until_ready()
+
+@bot.command(name="statvoc")
+@commands.has_permissions(manage_guild=True)
+async def statvoc(ctx, action: str = None, *, args: str = None):
+    """Salons vocaux "stats" personnalisables, mis à jour automatiquement toutes les 5 minutes.
+    Usage :
+      +statvoc create <membres|enligne|vocal|boosts> [format avec {count}]
+      +statvoc format <id_salon> <format avec {count}>
+      +statvoc remove <id_salon>
+      +statvoc list
+    Le format par défaut utilise {count} comme variable, ex : "👥 Membres : {count}"."""
+    gid = str(ctx.guild.id)
+    cfg = get_statsvoc_cfg(gid)
+
+    if not action:
+        types_help = ", ".join(f"`{t}`" for t in STATSVOC_TYPES)
+        return await ctx.reply(
+            f"❌ Usage : `{PREFIX}statvoc create <type> [format]` (types : {types_help})\n"
+            f"`{PREFIX}statvoc format <id_salon> <format>` · `{PREFIX}statvoc remove <id_salon>` · `{PREFIX}statvoc list`"
+        )
+    action = action.lower()
+
+    if action == "create":
+        if not args:
+            types_help = ", ".join(f"`{t}`" for t in STATSVOC_TYPES)
+            return await ctx.reply(f"❌ Usage : `{PREFIX}statvoc create <type> [format]` (types : {types_help})")
+        parts = args.split(None, 1)
+        stat_type = parts[0].lower()
+        custom_format = parts[1].strip() if len(parts) > 1 else None
+        if stat_type not in STATSVOC_TYPES:
+            types_help = ", ".join(f"`{t}`" for t in STATSVOC_TYPES)
+            return await ctx.reply(f"❌ Type invalide. Choix : {types_help}")
+        if custom_format and "{count}" not in custom_format:
+            return await ctx.reply("❌ Le format doit contenir la variable `{count}`.")
+
+        fmt = custom_format or STATSVOC_TYPES[stat_type]["default_format"]
+        count = compute_statsvoc_value(ctx.guild, stat_type)
+        chan_name = fmt.replace("{count}", str(count))[:100]
+
+        try:
+            channel = await ctx.guild.create_voice_channel(
+                chan_name,
+                overwrites={
+                    ctx.guild.default_role: discord.PermissionOverwrite(connect=False, view_channel=True),
+                    ctx.guild.me: discord.PermissionOverwrite(connect=True, view_channel=True, manage_channels=True),
+                },
+                reason=f"Salon stat vocale ({stat_type}) créé par {ctx.author}"
+            )
+        except discord.Forbidden:
+            return await ctx.reply("❌ Je n'ai pas la permission de créer un salon vocal.")
+
+        cfg["channels"][str(channel.id)] = {"type": stat_type, "format": fmt}
+        save_statsvoc()
+        await ctx.reply(embed=success_embed(
+            "📊 Salon stat créé",
+            f"{channel.mention} affichera désormais **{STATSVOC_TYPES[stat_type]['label'].lower()}**, "
+            f"actualisé toutes les 5 minutes.\nFormat : `{fmt}`"
+        ))
+
+    elif action == "format":
+        if not args:
+            return await ctx.reply(f"❌ Usage : `{PREFIX}statvoc format <id_salon> <format avec {{count}}>`")
+        parts = args.split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            return await ctx.reply(f"❌ Usage : `{PREFIX}statvoc format <id_salon> <format avec {{count}}>`")
+        chan_id, new_fmt = parts[0], parts[1].strip()
+        if "{count}" not in new_fmt:
+            return await ctx.reply("❌ Le format doit contenir la variable `{count}`.")
+        data = cfg["channels"].get(chan_id)
+        if not data:
+            return await ctx.reply("❌ Ce salon n'est pas un salon stat configuré (`+statvoc list`).")
+        data["format"] = new_fmt
+        save_statsvoc()
+        await update_statsvoc_guild(ctx.guild)
+        await ctx.reply(embed=success_embed("📊 Format mis à jour", f"Nouveau format : `{new_fmt}`"))
+
+    elif action == "remove":
+        if not args or not args.strip().isdigit():
+            return await ctx.reply(f"❌ Usage : `{PREFIX}statvoc remove <id_salon>` (voir `{PREFIX}statvoc list`)")
+        chan_id = args.strip()
+        if chan_id not in cfg["channels"]:
+            return await ctx.reply("❌ Ce salon n'est pas un salon stat configuré.")
+        cfg["channels"].pop(chan_id, None)
+        save_statsvoc()
+        channel = ctx.guild.get_channel(int(chan_id))
+        if channel:
+            try:
+                await channel.delete(reason=f"Salon stat retiré par {ctx.author}")
+            except Exception:
+                pass
+        await ctx.reply(embed=success_embed("📊 Salon stat retiré", "La configuration et le salon ont été supprimés."))
+
+    elif action == "list":
+        if not cfg["channels"]:
+            return await ctx.reply(f"ℹ️ Aucun salon stat configuré. Crée-en un avec `{PREFIX}statvoc create <type>`.")
+        lines = []
+        for chan_id, data in cfg["channels"].items():
+            channel = ctx.guild.get_channel(int(chan_id))
+            label = STATSVOC_TYPES.get(data.get("type"), {}).get("label", data.get("type"))
+            lines.append(f"{channel.mention if channel else f'`{chan_id}` (supprimé)'} — {label} — format : `{data.get('format')}`")
+        await ctx.send(embed=info_embed("📊 Salons stats configurés", "\n".join(lines)))
+
+    elif action in ("update", "refresh"):
+        await update_statsvoc_guild(ctx.guild)
+        await ctx.reply(embed=success_embed("📊 Actualisation", "Les salons stats ont été actualisés."))
+
+    else:
+        await ctx.reply("❌ Action invalide. Utilise `create`, `format`, `remove`, `list` ou `update`.")
 
 # ─────────────────────────────────────────
 #  UTILITAIRES
